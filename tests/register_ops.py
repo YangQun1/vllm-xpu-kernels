@@ -143,6 +143,18 @@ def gather_cache(src_cache: torch.Tensor,
                                         cu_seq_lens, batch_size, seq_starts)
 
 
+def indexer_k_quant_and_cache(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    quant_block_size: int,
+    kv_cache_dtype: str,
+) -> None:
+    torch.ops._C_cache_ops.indexer_k_quant_and_cache(
+        k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
+    )
+
+
 def static_scaled_fp8_quant(out: torch.Tensor, input: torch.Tensor,
                             scale: torch.Tensor) -> None:
     torch.ops._C.static_scaled_fp8_quant(out, input, scale)

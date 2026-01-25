@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from tests import register_ops as ops
-from tests.register_ops import reshape_and_cache, reshape_and_cache_flash
+from tests.register_ops import reshape_and_cache, reshape_and_cache_flash, indexer_k_quant_and_cache
 from tests.utils import (_convert_from_fp8, create_kv_caches_with_random,
                          create_kv_caches_with_random_flash, opcheck,
                          seed_everything)
@@ -490,3 +490,39 @@ def test_gather_cache_mla(kv_lora_rank, qk_rope_head_dim, block_size,
 
     ops.gather_cache(src_cache, dst, block_table, cu_seq_lens, batch_size)
     torch.testing.assert_close(dst, expected)
+
+
+@pytest.mark.parametrize("quant_block_size", [128,])
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8",])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+def test_indexer_k_quant_and_cache(quant_block_size, kv_cache_dtype, num_blocks, num_tokens):
+    head_dim = 128
+    cache_block_size = 128
+    cache_stride = head_dim + head_dim // quant_block_size * 4
+
+    # Create a random slot mapping.
+    slot_mapping_lst = random.sample(range(cache_block_size), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping_lst, dtype=torch.long)
+
+    # Create random key tensor.
+    k = torch.randn(num_tokens, head_dim, dtype=torch.float32)
+
+    # Create the KV cache.
+    kv_cache = torch.zeros((num_blocks, cache_block_size, cache_stride), dtype=torch.uint8)
+
+    # Quantize and cache the keys using the indexer kernel.
+    opcheck(
+        torch.ops._C_cache_ops.indexer_k_quant_and_cache,
+        (k, kv_cache, slot_mapping, kv_cache_dtype),
+    )
+
+    indexer_k_quant_and_cache(k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype)
+
+    # Call the indexer kernel (assuming it exists).
+    opcheck(
+        torch.ops._C_cache_ops.indexer_k_quant_and_cache,
+        (k, kv_cache, slot_mapping, kv_cache_dtype),
+    )
+    
+    # Additional assertions can be added here to verify the correctness of the operation.
