@@ -400,9 +400,7 @@ class indexer_k_quant_and_cache_kernel {
       use_ue8m0_(use_ue8m0) {}
 
   void operator()(const sycl::nd_item<2>& item) const {
-    static_assert(sizeof(scalar_t) == 2, "Only 16 bits dtype is supported for k tensor.");
-
-    constexpr int VEC_SIZE = 4;
+    constexpr int VEC_SIZE = 8;
 
     auto blockIdx_x = item.get_global_id(0);
     auto blockIdx_y = item.get_global_id(1);
@@ -424,19 +422,21 @@ class indexer_k_quant_and_cache_kernel {
       return;
     }
 
-    using srcx4_t = vec4_t<scalar_t>;
+    using srcx4_t = fp8::vec4_t<scalar_t>;
 
-    srcx4_t k_val = (reinterpret_cast<srcx4_t const*>(k_))[(token_idx * head_dim_ + head_dim_idx) / VEC_SIZE];
-    scalar_t* k_val_ptr = reinterpret_cast<scalar_t*>(&k_val);
+    scalar_t k_vals[8];
+    srcx4_t* k_val_vec_ptr = reinterpret_cast<srcx4_t*>(k_vals);
+
+    *k_val_vec_ptr = (reinterpret_cast<srcx4_t const*>(k_))[(token_idx * head_dim_ + head_dim_idx) / 4];
+    *(k_val_vec_ptr + 1) = (reinterpret_cast<srcx4_t const*>(k_))[(token_idx * head_dim_ + head_dim_idx) / 4 + 1];
+
     float amax = 0.0f;
     for (int i = 0; i < VEC_SIZE; i++) {
-      amax = sycl::max(amax, sycl::fabs(float(k_val_ptr[i])));
+      amax = sycl::max(amax, sycl::fabs(float(k_vals[i])));
     }
 
     // Reduced amax
-    for (int mask = 16; mask > 0; mask /= 2) {
-      amax = sycl::max(amax, sycl::sub_group::reduce_over_group(item.get_sub_group(), amax));
-    }
+    amax = sycl::reduce_over_group(item.get_sub_group(), amax, sycl::maximum<float>());
 
     float scale = sycl::max(amax, 1e-4f) / 448.0f;
     if (use_ue8m0_) {
@@ -445,16 +445,18 @@ class indexer_k_quant_and_cache_kernel {
 
     fp8::CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{scale};
 
-    const int64_t dst_offset = block_idx * cache_block_size_ * cache_stride_ +
-                                block_offset * head_dim_ + head_dim_idx;
+    const int64_t block_start = block_idx * cache_block_size_ * cache_stride_;
+    const int64_t slot_start = block_offset * head_dim_;
+
+    const int64_t dst_offset = block_start + slot_start + head_dim_idx;
     for (int i = 0; i < VEC_SIZE; i++) {
-      k_op(kv_cache_[dst_offset + i], k_val_ptr[i]);
+      k_op(kv_cache_[dst_offset + i], k_vals[i]);
     }
     if (threadIdx_x == 0) {
       const int64_t dst_scale_idx =
-          block_idx * cache_block_size_ * cache_stride_ +
+          block_start +
           cache_block_size_ * head_dim_ +
-          (block_offset * head_dim_ + head_dim_idx) * 4 / quant_block_size_;
+          (slot_start + head_dim_idx) * 4 / quant_block_size_;
       reinterpret_cast<float*>(kv_cache_)[dst_scale_idx / 4] = scale;
     }
   }
@@ -502,103 +504,104 @@ class concat_and_cache_ds_mla_kernel {
         scale(scale) {}
 
   void operator()(const sycl::nd_item<1> item) const {
-    auto blockIdx_x = item.get_global_id(0);
-    auto blockIdx_y = item.get_global_id(1);
-    auto blockDim_x = item.get_local_range(0);
-    auto blockDim_y = item.get_local_range(1);
-    auto threadIdx_x = item.get_local_id(0);
-    auto threadIdx_y = item.get_local_id(1);
+  //   auto blockIdx_x = item.get_global_id(0);
+  //   auto blockIdx_y = item.get_global_id(1);
+  //   auto blockDim_x = item.get_local_range(0);
+  //   auto blockDim_y = item.get_local_range(1);
+  //   auto threadIdx_x = item.get_local_id(0);
+  //   auto threadIdx_y = item.get_local_id(1);
 
-    const int64_t token_idx = blockIdx_x;
-    const int64_t slot_idx = slot_mapping[token_idx];
-    // NOTE: slot_idx can be -1 if the token is padded
-    if (slot_idx < 0) {
-      return;
-    }
-    const int64_t block_idx = slot_idx / block_size;
-    const int64_t block_offset = slot_idx % block_size;
-    const int64_t dst_idx_start =
-        block_idx * block_stride + block_offset * entry_stride;
+  //   const int64_t token_idx = blockIdx_x;
+  //   const int64_t slot_idx = slot_mapping[token_idx];
+  //   // NOTE: slot_idx can be -1 if the token is padded
+  //   if (slot_idx < 0) {
+  //     return;
+  //   }
+  //   const int64_t block_idx = slot_idx / block_size;
+  //   const int64_t block_offset = slot_idx % block_size;
+  //   const int64_t dst_idx_start =
+  //       block_idx * block_stride + block_offset * entry_stride;
 
-    // For the NoPE part, each tile of 128 elements is handled by half of one warp
-    // (16 threads). There are 4 total tiles, so 2 warps (64 threads).
-    // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
-    // The RoPE part (last 64 elements) is handled by another 1 warp (32 threads).
-    // So in total, we use 3 warps (96 threads) per block.
+  //   // For the NoPE part, each tile of 128 elements is handled by half of one warp
+  //   // (16 threads). There are 4 total tiles, so 2 warps (64 threads).
+  //   // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
+  //   // The RoPE part (last 64 elements) is handled by another 1 warp (32 threads).
+  //   // So in total, we use 3 warps (96 threads) per block.
 
-    // Cast kv_cache to 16_bit for RoPE values
-    scalar_t* kv_cache_16bit =
-        reinterpret_cast<scalar_t*>(&kv_cache[dst_idx_start]);
+  //   // Cast kv_cache to 16_bit for RoPE values
+  //   scalar_t* kv_cache_16bit =
+  //       reinterpret_cast<scalar_t*>(&kv_cache[dst_idx_start]);
 
-    // The last warp handles the RoPE part
-    if (threadIdx_x >= 64) {
-      // Each thread handles two elements of RoPE
-      const int8_t pe_idx_start = (threadIdx_x - 64) * 2;
-      const int64_t src_idx = token_idx * k_pe_stride + pe_idx_start;
-      // Vectorized load of two 16-bit values, performed as one 32-bit load
-      const int32_t vals = *reinterpret_cast<const int32_t*>(&k_pe[src_idx]);
-      // RoPE values start after the packed 8-bit NoPE values and the
-      // 32-bit scales
-      const int64_t dst_idx = kv_lora_rank / 2 + 8 + pe_idx_start;
-      // Vectorized store of two 16-bit values, performed as one 32-bit store
-      *reinterpret_cast<int32_t*>(&kv_cache_16bit[dst_idx]) = vals;
-      return;
-    }
+  //   // The last warp handles the RoPE part
+  //   if (threadIdx_x >= 64) {
+  //     // Each thread handles two elements of RoPE
+  //     const int8_t pe_idx_start = (threadIdx_x - 64) * 2;
+  //     const int64_t src_idx = token_idx * k_pe_stride + pe_idx_start;
+  //     // Vectorized load of two 16-bit values, performed as one 32-bit load
+  //     const int32_t vals = *reinterpret_cast<const int32_t*>(&k_pe[src_idx]);
+  //     // RoPE values start after the packed 8-bit NoPE values and the
+  //     // 32-bit scales
+  //     const int64_t dst_idx = kv_lora_rank / 2 + 8 + pe_idx_start;
+  //     // Vectorized store of two 16-bit values, performed as one 32-bit store
+  //     *reinterpret_cast<int32_t*>(&kv_cache_16bit[dst_idx]) = vals;
+  //     return;
+  //   }
 
-    // The first two warps handle the NoPE part
-    const int8_t warp_idx = threadIdx_x >> 5;
-    const int8_t lane_idx = threadIdx_x & 31;
-    const int8_t tile_idx = warp_idx * 2 + (lane_idx >> 4);
+  //   // The first two warps handle the NoPE part
+  //   const int8_t warp_idx = threadIdx_x >> 5;
+  //   const int8_t lane_idx = threadIdx_x & 31;
+  //   const int8_t tile_idx = warp_idx * 2 + (lane_idx >> 4);
 
-    // Each thread handles 8 elements of NoPE
-    // Load the NoPE elements for this thread into registers
-    const int64_t src_idx_start = token_idx * kv_c_stride + (threadIdx_x * 8);
-    // Vectorized load of eight 16-bit values, performed as an int4 load
-    using int4 = vec4_t<int32_t>;
-    const int4 vals_i4 = *reinterpret_cast<const int4*>(&kv_c[src_idx_start]);
-    const scalar_t* vals = reinterpret_cast<const scalar_t*>(&vals_i4);
+  //   // Each thread handles 8 elements of NoPE
+  //   // Load the NoPE elements for this thread into registers
+  //   const int64_t src_idx_start = token_idx * kv_c_stride + (threadIdx_x * 8);
+  //   // Vectorized load of eight 16-bit values, performed as an int4 load
+  //   using int4 = vec4_t<int32_t>;
+  //   const int4 vals_i4 = *reinterpret_cast<const int4*>(&kv_c[src_idx_start]);
+  //   const scalar_t* vals = reinterpret_cast<const scalar_t*>(&vals_i4);
 
-    // Max absolute value of this thread's elements
-    float max_abs = fmaxf(fmaxf(fmaxf(fabsf(vals[0]), fabsf(vals[1])),
-                                fmaxf(fabsf(vals[2]), fabsf(vals[3]))),
-                          fmaxf(fmaxf(fabsf(vals[4]), fabsf(vals[5])),
-                                fmaxf(fabsf(vals[6]), fabsf(vals[7]))));
+  //   // Max absolute value of this thread's elements
+  //   float max_abs = fmaxf(fmaxf(fmaxf(fabsf(vals[0]), fabsf(vals[1])),
+  //                               fmaxf(fabsf(vals[2]), fabsf(vals[3]))),
+  //                         fmaxf(fmaxf(fabsf(vals[4]), fabsf(vals[5])),
+  //                               fmaxf(fabsf(vals[6]), fabsf(vals[7]))));
 
-    // Warp-level reduction to find the max absolute value in each half-warp
-  #pragma unroll
-    for (int offset = 8; offset > 0; offset /= 2) {
-      max_abs = fmaxf(max_abs, VLLM_SHFL_XOR_SYNC_WIDTH(max_abs, offset, 16));
-    }
+  //   // Warp-level reduction to find the max absolute value in each half-warp
+  // #pragma unroll
+  //   for (int offset = 8; offset > 0; offset /= 2) {
+  //     max_abs = fmaxf(max_abs, VLLM_SHFL_XOR_SYNC_WIDTH(max_abs, offset, 16));
+  //   }
 
-    // Compute the scale for the tile
-    float tile_scale = max_abs / 448.f;
-    tile_scale = fmaxf(tile_scale, FLT_MIN);
+  //   // Compute the scale for the tile
+  //   float tile_scale = max_abs / 448.f;
+  //   tile_scale = fmaxf(tile_scale, FLT_MIN);
 
-    // The first lane of each half-warp writes the scale to kv_cache
-    if ((lane_idx == 0) || (lane_idx == 16)) {
-      float* kv_cache_32bit = reinterpret_cast<float*>(&kv_cache[dst_idx_start]);
-      const uint64_t dst_idx = kv_lora_rank / 4 + tile_idx;
-      kv_cache_32bit[dst_idx] = tile_scale;
-    }
+  //   // The first lane of each half-warp writes the scale to kv_cache
+  //   if ((lane_idx == 0) || (lane_idx == 16)) {
+  //     float* kv_cache_32bit = reinterpret_cast<float*>(&kv_cache[dst_idx_start]);
+  //     const uint64_t dst_idx = kv_lora_rank / 4 + tile_idx;
+  //     kv_cache_32bit[dst_idx] = tile_scale;
+  //   }
 
-    // Now all threads in the block scale and write their elements
-    // NoPE data is packed in the first kv_lora_rank/2 bytes (first 256 bytes)
-    const int64_t dst_idx_base = dst_idx_start + (threadIdx_x * 8);
+  //   // Now all threads in the block scale and write their elements
+  //   // NoPE data is packed in the first kv_lora_rank/2 bytes (first 256 bytes)
+  //   const int64_t dst_idx_base = dst_idx_start + (threadIdx_x * 8);
 
-    fp8::CopyWithScaleOp<uint8_t, scalar_t, kv_dt> val_op{tile_scale};
+  //   fp8::CopyWithScaleOp<uint8_t, scalar_t, kv_dt> val_op{tile_scale};
 
-    uint8_t result[8];
-  #pragma unroll
-    for (int i = 0; i < 8; i++) {
-      val_op(result[i], vals[i]);
-    }
+  //   uint8_t result[8];
+  // #pragma unroll
+  //   for (int i = 0; i < 8; i++) {
+  //     val_op(result[i], vals[i]);
+  //   }
 
-    // Store as aligned 64-bit writes
-    *reinterpret_cast<uint64_t*>(&kv_cache[dst_idx_base]) =
-        *reinterpret_cast<const uint64_t*>(result);
+  //   // Store as aligned 64-bit writes
+  //   *reinterpret_cast<uint64_t*>(&kv_cache[dst_idx_base]) =
+  //       *reinterpret_cast<const uint64_t*>(result);
   }
 
  private:
+  const scalar_t* __restrict__ kv_c;  // [num_tokens, kv_lora_rank]
   const scalar_t* __restrict__ k_pe;  // [num_tokens, pe_dim]
   cache_t* __restrict__ kv_cache;  // [num_blocks, block_size, (kv_lora_rank +
                                    // pe_dim)]
@@ -935,14 +938,14 @@ void indexer_k_quant_and_cache(
   TORCH_CHECK(head_dim % quant_block_size == 0,
               "head_dim must be divisible by quant_block_size");
 
-  constexpr int vec_size = 4;
-  // 纵向，每个token分别由不同的block处理
-  // 横向，每个token的head_dim维度被quant_block_size * vec_size个block处理
-  // 这样，每个block就会处理一个token的quant_block_size * vec_size部分的数据
+  constexpr int vec_size = 8;
   sycl::range<2> grid(num_tokens, (head_dim + quant_block_size * vec_size - 1) /
                             (quant_block_size * vec_size));
-  sycl::range<2> block(32, vec_size);
-  const at::DeviceGuard device_guard(src_cache.device());
+  sycl::range<2> block(16, 1);
+  std::cout << "block: " << block[0] << ", " << block[1] << std::endl;
+  std::cout << "grid: " << grid[0] << ", " << grid[1] << std::endl;
+
+  const at::DeviceGuard device_guard(k.device());
   auto& queue = vllm::xpu::vllmGetQueue();
 
   DISPATCH_BY_KV_CACHE_DTYPE(k.scalar_type(), "fp8_e4m3",
