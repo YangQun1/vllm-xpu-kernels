@@ -9,6 +9,30 @@ DEVICES = [
     f"xpu:{i}" for i in range(1 if torch.xpu.device_count() == 1 else 2)
 ]
 
+def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
+    # x: (num_blocks, block_size, 1, head_dim)
+    num_blocks, block_size, num_heads, head_dim = x.shape
+    assert num_heads == 1
+    x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
+    sf = x_amax / 448.0
+    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
+    x_fp8 = torch.empty(
+        (num_blocks, block_size * (head_dim + 4)),
+        device=x.device,
+        dtype=torch.uint8,
+    )
+    x_fp8[:, : block_size * head_dim] = x_scaled.view(
+        num_blocks, block_size * head_dim
+    ).view(dtype=torch.uint8)
+    x_fp8[:, block_size * head_dim :] = sf.view(num_blocks, block_size).view(
+        dtype=torch.uint8
+    )
+    return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
+
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
+
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     """Return a global difference metric for unit tests.
 
@@ -332,3 +356,318 @@ def test_triton_fp8_mqa_logits(seq_len, seq_len_kv, disable_cp, device):
     print(f"Triton implementation total time for {num_iterations} iterations: {triton_time:.6f} seconds")
     assert triton_time < torch_time, "Expected Triton implementation to be faster than Torch implementation"
 
+
+def fp8_paged_mqa_logits_torch(
+    q: torch.Tensor, # (batch_size, next_n, heads, index_dim)
+    kv_cache: torch.Tensor, # (num_blocks, blocksize, 1, index_dim+4)
+    weights: torch.Tensor, # (batch_size * next_n, heads)
+    context_lens: torch.Tensor, # (batch_size,)
+    block_tables: torch.Tensor, # (batch_size, max_blocks)
+    max_model_len: int,
+):
+    fp8_dtype = torch.float8_e4m3fn # current_platform.fp8_dtype()
+    batch_size, next_n, _, dim = q.size()
+    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
+    scale = scale.contiguous().view(torch.float)
+    q = q.float()
+    kv_cache = kv_cache.view(fp8_dtype).float() * scale
+    num_block, block_size, _, dim = kv_cache.size()
+    logits = torch.full(
+        [batch_size * next_n, max_model_len],
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    context_lens = context_lens.tolist()
+    for i in range(batch_size):
+        context_len = context_lens[i]
+        q_offsets = torch.arange(context_len - next_n, context_len, device="xpu:0")
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
+        for block_rk in range(cdiv(context_len, block_size)):
+            block_idx = block_tables[i][block_rk]
+            qx, kx = q[i], kv_cache[block_idx]
+            k_offsets = torch.arange(
+                block_rk * block_size, (block_rk + 1) * block_size, device="xpu:0"
+            )
+            mask = (k_offsets[None, :] < context_len) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
+            s = torch.where(
+                mask[None, :, :],
+                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
+                    logits.dtype
+                ),
+                float("-inf"),
+            )
+            s = torch.relu(s) * weight_slice[..., None]
+            s = s.sum(dim=0)
+            logits[
+                i * next_n : (i + 1) * next_n,
+                block_rk * block_size : (block_rk + 1) * block_size,
+            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
+    return logits
+
+@triton.jit
+def triton_fp8_paged_mqa_logits_kernel(
+    # Pointers to tensors
+    q_fp8_ptr,
+    kv_cache_fp8_ptr,
+    weights_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    logits_ptr,
+    # Shapes
+    batch_size,
+    next_n,
+    heads,
+    index_dim,
+    num_blocks,
+    block_size,
+    max_blocks,
+    max_model_len,
+    # Meta-parameters
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):    
+    curr_batch = tl.program_id(0)
+    curr_block = tl.program_id(1)
+    
+    if curr_batch >= batch_size:
+        return
+    
+    context_len = tl.load(context_lens_ptr + curr_batch)
+    
+    block_start = curr_block * BLOCK_N
+    
+    if block_start >= context_len:
+        return
+    
+    block_end = tl.minimum(block_start + BLOCK_N, context_len)
+    actual_block_size = block_end - block_start
+    
+    block_table_idx = curr_batch * max_blocks + curr_block
+    physical_block_idx = tl.load(block_tables_ptr + block_table_idx)
+    
+    if physical_block_idx < 0 or physical_block_idx >= num_blocks:
+        return
+    
+    q_start = context_len - next_n
+    q_offsets = q_start + tl.arange(0, BLOCK_M)
+    
+    k_offsets = block_start + tl.arange(0, BLOCK_N)
+    
+    mask_k_valid = k_offsets < context_len
+    mask_kq = (k_offsets[None, :] <= q_offsets[:, None]) & mask_k_valid[None, :]
+    
+    weight_start_idx = curr_batch * next_n
+    
+    logits_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    kv_block_stride = block_size * (index_dim + 4)
+    kv_pos_stride = index_dim + 4
+    
+    scale_ptrs = kv_cache_fp8_ptr + physical_block_idx * kv_block_stride + \
+                 tl.arange(0, BLOCK_N) * kv_pos_stride + index_dim
+    scales = tl.load(scale_ptrs, mask=mask_k_valid, other=1.0)
+    
+    q_batch_stride = next_n * heads * index_dim
+    q_seq_stride = heads * index_dim
+    q_head_stride = index_dim
+    
+    for h in range(heads):
+        q_head_ptr = q_fp8_ptr + curr_batch * q_batch_stride + h * q_head_stride
+        q_ptrs = q_head_ptr + tl.arange(0, BLOCK_M)[:, None] * q_seq_stride + \
+                 tl.arange(0, BLOCK_D)[None, :]
+        q_fp8 = tl.load(q_ptrs) 
+        
+        k_block_ptr = kv_cache_fp8_ptr + physical_block_idx * kv_block_stride
+        k_ptrs = k_block_ptr + tl.arange(0, BLOCK_N)[:, None] * kv_pos_stride + \
+                 tl.arange(0, BLOCK_D)[None, :]
+        k_fp8 = tl.load(k_ptrs, mask=tl.arange(0, BLOCK_N)[:, None] < actual_block_size)
+        
+        head_logits = tl.dot(q_fp8.to(tl.bfloat16), k_fp8.to(tl.bfloat16), out_dtype=tl.float32)
+
+        head_logits = head_logits * scales[None, :]
+        
+        head_logits = tl.maximum(head_logits, 0.0)
+        
+        weight = tl.load(weights_ptr + weight_start_idx * heads + tl.arange(0, BLOCK_M) * heads + h)
+
+        logits_acc += head_logits * weight[:, None]
+    
+    logits_masked = tl.where(mask_kq, logits_acc, float('-inf'))
+
+    row_offsets = tl.arange(0, BLOCK_M) * max_model_len
+    col_offsets = block_start + tl.arange(0, BLOCK_N)
+
+    out_offsets = curr_batch * next_n * max_model_len + row_offsets[:, None] + col_offsets[None, :]
+    valid_key_mask = tl.arange(0, BLOCK_N)[None, :] < actual_block_size
+    tl.store(logits_ptr + out_offsets, logits_masked, mask=valid_key_mask)
+
+def triton_fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor, # (batch_size, next_n, heads, index_dim)
+    kv_cache_fp8: torch.Tensor, # (num_blocks, blocksize, 1, index_dim+4)
+    weights: torch.Tensor, # (batch_size * next_n, heads)
+    context_lens: torch.Tensor, # (batch_size,)
+    block_tables: torch.Tensor, # (batch_size, max_blocks)
+    schedule_metadata,
+    max_model_len: int,
+):
+    """Compute FP8 MQA logits using paged KV-cache.
+
+    Args:
+        q_fp8: Query tensor of shape [B, next_n, H, D]. Casted to
+            `torch.float8_e4m3fn` by caller.
+        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
+            [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. The last
+            4 bytes per (block,pos) store the `float` dequant scale.
+        weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
+        context_lens: Tensor of shape [B], dtype int32; effective context length
+            for each batch element.
+        block_tables: Tensor of shape [B, max_blocks], dtype int32; maps logical
+            block indices to physical blocks in the paged cache.
+        schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
+            used to distribute work across SMs. Currently unused.
+        max_model_len: Maximum sequence length used to size the logits output.
+
+    Returns:
+        Logits tensor of shape [B * next_n, max_model_len], dtype
+        `torch.float32`.
+    """
+    batch_size, next_n, heads, index_dim = q_fp8.size()
+    num_blocks, block_size, _, _ = kv_cache_fp8.size()
+    max_blocks = block_tables.size(1)
+
+    BLOCK_M = next_n
+    BLOCK_N = block_size
+    BLOCK_D = index_dim
+
+    logits = torch.empty(
+        (batch_size * next_n, max_model_len),
+        device=q_fp8.device,
+        dtype=torch.float32,
+    )
+
+    grid = (
+        batch_size,
+        triton.cdiv(max_model_len, BLOCK_N),
+    )
+
+    triton_fp8_paged_mqa_logits_kernel[grid](
+        q_fp8_ptr=q_fp8,
+        kv_cache_fp8_ptr=kv_cache_fp8,
+        weights_ptr=weights,
+        context_lens_ptr=context_lens,
+        block_tables_ptr=block_tables,
+        logits_ptr=logits,
+        batch_size=batch_size,
+        next_n=next_n,
+        heads=heads,
+        index_dim=index_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        max_blocks=max_blocks,
+        max_model_len=max_model_len,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+    )
+
+    return logits
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_deepgemm_fp8_paged_mqa_logits(device):
+    torch.manual_seed(0)
+    random.seed(0)
+
+    max_model_len = 4096
+
+    # for batch_size, next_n in [(4, 1), (2, 2)]:
+    for batch_size, next_n in [(4, 2)]:
+        for heads, index_dim in [(32, 128)]:
+            for avg_kv in (2048,):
+                num_blocks, blocksize = max_model_len * 2, 64
+
+                q = torch.randn(
+                    (batch_size, next_n, heads, index_dim),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                kv_cache = torch.randn(
+                    (num_blocks, blocksize, 1, index_dim),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                weights = torch.randn(
+                    (batch_size * next_n, heads),
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                context_lens = (
+                    torch.randint(int(0.8 * avg_kv), int(1.2 * avg_kv), (batch_size,))
+                    .cuda()
+                    .to(torch.int32)
+                )
+                max_block_len = (
+                    (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
+                )
+                block_tables = torch.zeros(
+                    (batch_size, max_block_len),
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                counter = 0
+                block_idx_pool = list(range(num_blocks))
+                random.shuffle(block_idx_pool)
+                for i in range(batch_size):
+                    ctx_len = int(context_lens[i].item())
+                    for j in range((ctx_len + blocksize - 1) // blocksize):
+                        block_tables[i][j] = block_idx_pool[counter]
+                        counter += 1
+
+                q_fp8 = q.to(torch.float8_e4m3fn)
+                kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+
+                schedule_metadata = None
+                
+                logits = triton_fp8_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    context_lens,
+                    block_tables,
+                    schedule_metadata,
+                    max_model_len,
+                )
+
+                ref_logits = fp8_paged_mqa_logits_torch(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    context_lens,
+                    block_tables,
+                    max_model_len,
+                )
+
+                positions = (
+                    torch.arange(max_model_len, device=device)
+                    .unsqueeze(0)
+                    .expand(batch_size * next_n, -1)
+                )
+                row_indices = torch.arange(batch_size * next_n, device=device) // next_n
+                next_n_offset = (
+                    torch.arange(batch_size * next_n, device=device) % next_n
+                )
+                mask = positions <= (
+                    context_lens[row_indices] - next_n + next_n_offset
+                ).unsqueeze(1)
+
+                logits = logits.masked_fill(~mask, 0)
+                ref_logits = ref_logits.masked_fill(~mask, 0)
+                diff = calc_diff(logits, ref_logits)
+                assert diff < 1e-3, f"{diff=}"
