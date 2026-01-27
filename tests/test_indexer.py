@@ -204,8 +204,8 @@ def triton_fp8_mqa_logits(
     head_dim = q.shape[2]
     seq_len_kv = kv.shape[0]
 
-    BLOCK_M = 16
-    BLOCK_N = 16
+    BLOCK_M = 32
+    BLOCK_N = 32
     BLOCK_D = head_dim
 
     logits = torch.empty((seq_len, seq_len_kv), device=q.device, dtype=torch.float32)
@@ -289,4 +289,32 @@ def test_triton_fp8_mqa_logits(seq_len, seq_len_kv, disable_cp, device):
     logits = logits.masked_fill(neginf_mask, 0)
     
     torch.testing.assert_close(logits, ref_logits, atol=0.3, rtol=0.3)
-    
+
+    # simple benchmark: run multiple iterations for both torch impl and triton
+    # impl, and comare the host time
+    import time
+    num_iterations = 1000
+    start_time_torch = time.time()
+    for _ in range(num_iterations):
+        ref_logits = fp8_mqa_logits_torch(
+            q=q_fp8,
+            kv=kv_fp8,
+            weights=weights,
+            cu_seqlen_ks=ks,
+            cu_seqlen_ke=ke,
+        )
+    torch.xpu.synchronize()
+    end_time_torch = time.time()
+    torch_time = end_time_torch - start_time_torch
+
+    start_time_triton = time.time()
+    for _ in range(num_iterations):
+        logits = triton_fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+    torch.xpu.synchronize()
+    end_time_triton = time.time()
+    triton_time = end_time_triton - start_time_triton
+
+    print(f"Torch implementation total time for {num_iterations} iterations: {torch_time:.6f} seconds")
+    print(f"Triton implementation total time for {num_iterations} iterations: {triton_time:.6f} seconds")
+    assert triton_time < torch_time, "Expected Triton implementation to be faster than Torch implementation"
+
