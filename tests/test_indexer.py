@@ -1,5 +1,6 @@
 import random
 import pytest
+import pdb
 
 import torch
 import triton
@@ -272,7 +273,6 @@ def triton_fp8_mqa_logits(
 
     return logits
 
-import pdb
 
 @pytest.mark.parametrize("seq_len", [512,])
 @pytest.mark.parametrize("seq_len_kv", [1024,])
@@ -367,11 +367,15 @@ def fp8_paged_mqa_logits_torch(
 ):
     fp8_dtype = torch.float8_e4m3fn # current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
-    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
-    scale = scale.contiguous().view(torch.float)
+    num_blocks, block_size, _, _ = kv_cache.size()
+
+    kv_cache = kv_cache.view(num_blocks, -1)
+    kv_cache_value = kv_cache[:, : block_size * dim].view(num_blocks, block_size, 1, dim)
+    kv_cache_scale = kv_cache[:, block_size * dim :].view(num_blocks, block_size, 1, 4).view(torch.float32)
+
     q = q.float()
-    kv_cache = kv_cache.view(fp8_dtype).float() * scale
-    num_block, block_size, _, dim = kv_cache.size()
+    kv_cache_value = kv_cache_value.view(fp8_dtype).float() * kv_cache_scale
+
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -387,7 +391,7 @@ def fp8_paged_mqa_logits_torch(
         )
         for block_rk in range(cdiv(context_len, block_size)):
             block_idx = block_tables[i][block_rk]
-            qx, kx = q[i], kv_cache[block_idx]
+            qx, kx = q[i], kv_cache_value[block_idx]
             k_offsets = torch.arange(
                 block_rk * block_size, (block_rk + 1) * block_size, device="xpu:0"
             )
@@ -414,6 +418,7 @@ def triton_fp8_paged_mqa_logits_kernel(
     # Pointers to tensors
     q_fp8_ptr,
     kv_cache_fp8_ptr,
+    kv_cache_fp32_ptr,
     weights_ptr,
     context_lens_ptr,
     block_tables_ptr,
@@ -466,29 +471,36 @@ def triton_fp8_paged_mqa_logits_kernel(
     
     logits_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    kv_block_stride = block_size * (index_dim + 4)
-    kv_pos_stride = index_dim + 4
-    
-    scale_ptrs = kv_cache_fp8_ptr + physical_block_idx * kv_block_stride + \
-                 tl.arange(0, BLOCK_N) * kv_pos_stride + index_dim
+    cache_block_stride = block_size * (index_dim + 4)
+    cache_slot_value_stride = index_dim
+
+    cache_block_value_base_ptr = kv_cache_fp8_ptr + physical_block_idx * cache_block_stride
+
+    cache_block_scale_offset = block_size * cache_slot_value_stride
+    cache_slot_scale_stride = 4
+    cache_block_scale_base_ptr = kv_cache_fp32_ptr + \
+        (physical_block_idx * cache_block_stride + cache_block_scale_offset) // cache_slot_scale_stride
+
+    scale_ptrs = cache_block_scale_base_ptr + tl.arange(0, BLOCK_N)
     scales = tl.load(scale_ptrs, mask=mask_k_valid, other=1.0)
     
     q_batch_stride = next_n * heads * index_dim
     q_seq_stride = heads * index_dim
     q_head_stride = index_dim
     
+    q_batch_batch_ptr = q_fp8_ptr + curr_batch * q_batch_stride
+
     for h in range(heads):
-        q_head_ptr = q_fp8_ptr + curr_batch * q_batch_stride + h * q_head_stride
+        q_head_ptr = q_batch_batch_ptr + h * q_head_stride
         q_ptrs = q_head_ptr + tl.arange(0, BLOCK_M)[:, None] * q_seq_stride + \
-                 tl.arange(0, BLOCK_D)[None, :]
+                    tl.arange(0, BLOCK_D)[None, :]
         q_fp8 = tl.load(q_ptrs) 
         
-        k_block_ptr = kv_cache_fp8_ptr + physical_block_idx * kv_block_stride
-        k_ptrs = k_block_ptr + tl.arange(0, BLOCK_N)[:, None] * kv_pos_stride + \
-                 tl.arange(0, BLOCK_D)[None, :]
+        k_ptrs = cache_block_value_base_ptr + tl.arange(0, BLOCK_N)[:, None] * cache_slot_value_stride + \
+                    tl.arange(0, BLOCK_D)[None, :]
         k_fp8 = tl.load(k_ptrs, mask=tl.arange(0, BLOCK_N)[:, None] < actual_block_size)
-        
-        head_logits = tl.dot(q_fp8.to(tl.bfloat16), k_fp8.to(tl.bfloat16), out_dtype=tl.float32)
+
+        head_logits = tl.dot(q_fp8.to(tl.float16), k_fp8.to(tl.float16).T, out_dtype=tl.float32)
 
         head_logits = head_logits * scales[None, :]
         
@@ -545,8 +557,9 @@ def triton_fp8_paged_mqa_logits(
     BLOCK_N = block_size
     BLOCK_D = index_dim
 
-    logits = torch.empty(
+    logits = torch.full(
         (batch_size * next_n, max_model_len),
+        float("-inf"),
         device=q_fp8.device,
         dtype=torch.float32,
     )
@@ -556,9 +569,13 @@ def triton_fp8_paged_mqa_logits(
         triton.cdiv(max_model_len, BLOCK_N),
     )
 
+    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fn)
+    kv_cache_fp32 = kv_cache_fp8.view(torch.float32)
+
     triton_fp8_paged_mqa_logits_kernel[grid](
         q_fp8_ptr=q_fp8,
         kv_cache_fp8_ptr=kv_cache_fp8,
+        kv_cache_fp32_ptr=kv_cache_fp32,
         weights_ptr=weights,
         context_lens_ptr=context_lens,
         block_tables_ptr=block_tables,
@@ -579,14 +596,13 @@ def triton_fp8_paged_mqa_logits(
     return logits
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_deepgemm_fp8_paged_mqa_logits(device):
+def test_triton_fp8_paged_mqa_logits(device):
     torch.manual_seed(0)
     random.seed(0)
 
     max_model_len = 4096
 
-    # for batch_size, next_n in [(4, 1), (2, 2)]:
-    for batch_size, next_n in [(4, 2)]:
+    for batch_size, next_n in [(4, 1), (2, 2)]:
         for heads, index_dim in [(32, 128)]:
             for avg_kv in (2048,):
                 num_blocks, blocksize = max_model_len * 2, 64
@@ -609,7 +625,7 @@ def test_deepgemm_fp8_paged_mqa_logits(device):
 
                 context_lens = (
                     torch.randint(int(0.8 * avg_kv), int(1.2 * avg_kv), (batch_size,))
-                    .cuda()
+                    .xpu()
                     .to(torch.int32)
                 )
                 max_block_len = (
@@ -635,6 +651,15 @@ def test_deepgemm_fp8_paged_mqa_logits(device):
 
                 schedule_metadata = None
                 
+                ref_logits = fp8_paged_mqa_logits_torch(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    context_lens,
+                    block_tables,
+                    max_model_len,
+                )
+
                 logits = triton_fp8_paged_mqa_logits(
                     q_fp8,
                     kv_cache_fp8,
@@ -645,14 +670,10 @@ def test_deepgemm_fp8_paged_mqa_logits(device):
                     max_model_len,
                 )
 
-                ref_logits = fp8_paged_mqa_logits_torch(
-                    q_fp8,
-                    kv_cache_fp8,
-                    weights,
-                    context_lens,
-                    block_tables,
-                    max_model_len,
-                )
+                ref_neginf_mask = ref_logits == float("-inf")
+                neginf_mask = logits == float("-inf")
+
+                assert torch.equal(neginf_mask, ref_neginf_mask)
 
                 positions = (
                     torch.arange(max_model_len, device=device)
@@ -671,3 +692,42 @@ def test_deepgemm_fp8_paged_mqa_logits(device):
                 ref_logits = ref_logits.masked_fill(~mask, 0)
                 diff = calc_diff(logits, ref_logits)
                 assert diff < 1e-3, f"{diff=}"
+
+                torch.xpu.synchronize()
+
+                # simple benchmark: run multiple iterations for both torch impl and triton
+                # impl, and comare the host time
+                import time
+                num_iterations = 300
+                start_time_torch = time.time()
+                for _ in range(num_iterations):
+                    ref_logits = fp8_paged_mqa_logits_torch(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights,
+                        context_lens,
+                        block_tables,
+                        max_model_len,
+                    )
+                torch.xpu.synchronize()
+                end_time_torch = time.time()
+                torch_time = end_time_torch - start_time_torch
+
+                start_time_triton = time.time()
+                for _ in range(num_iterations):
+                    logits = triton_fp8_paged_mqa_logits(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights,
+                        context_lens,
+                        block_tables,
+                        schedule_metadata,
+                        max_model_len,
+                    )
+                torch.xpu.synchronize()
+                end_time_triton = time.time()
+                triton_time = end_time_triton - start_time_triton
+
+                print(f"Torch implementation total time for {num_iterations} iterations: {torch_time:.6f} seconds")
+                print(f"Triton implementation total time for {num_iterations} iterations: {triton_time:.6f} seconds")
+                assert triton_time < torch_time, "Expected Triton implementation to be faster than Torch implementation"
