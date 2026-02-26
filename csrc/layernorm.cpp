@@ -27,28 +27,50 @@ class rms_norm_kernel {
         hidden_size(hidden_size_),
         s_variance(s_variance_) {}
 
+  // TODO: No vectorized global memory load/store in this kernel, can it improve
+  // performance?
+
+  // the rmsnorm formula is:
+  // out = input / RMS(input) * weight, where
+  // RMS(input) = sqrt(mean(input^2) + epsilon)
+  
+  // This kernel read the inputs twice:
+  // - the first time to compute the variance (mean of input^2) and write the RMS value to shared local memory
+  // - the second time to compute the output using the variance from the first step
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     float* s_variance_ptr =
         s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
     float variance = 0.0f;
 
+    // get the work-item local variance first
+    // item_ct1.get_local_id(2) represents the thread index within the work-group
+    // item_ct1.get_local_range(2) represents the total number of threads in the work-group
+    // item_ct1.get_group(2) represents the work-group index, which corresponds to the token index in this case since we launch one work-group per token
+    // the thread read data in the following layout:
+    // t0, t1, ... tn-1, t0, t1, ... tn-1, ...
     for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
          idx += item_ct1.get_local_range(2)) {
       const float x = (float)input[item_ct1.get_group(2) * input_stride + idx];
       variance += x * x;
     }
 
+    // reduce variance within the work-group, to get the total sum of input^2
+    // TODO: how the reduce_over_group is implemented internally? does it use shared local memory?
     variance = sycl::reduce_over_group(
+        // get_work_group returns the group of the current work-item
         sycl::ext::oneapi::this_work_item::get_work_group<3>(),
         variance,
         sycl::plus<>());
+    
+    // write the RMS value to shared local memory, only one work-item needs to do this
     if (item_ct1.get_local_id(2) == 0) {
       *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
     }
 
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
+    // compute the output value using the RMS value from shared local memory
     for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
          idx += item_ct1.get_local_range(2)) {
       float x = (float)input[item_ct1.get_group(2) * input_stride + idx];
@@ -71,8 +93,8 @@ class rms_norm_kernel {
 template <typename scalar_t>
 void call_rms_norm_kernel(
     torch::Tensor& out,
-    torch::Tensor& input,
-    torch::Tensor& weight,
+    torch::Tensor& input, // shape [num_tokens, hidden_size]
+    torch::Tensor& weight, // shape [hidden_size]
     float epsilon) {
   using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
   int hidden_size = input.size(-1);
@@ -81,7 +103,7 @@ void call_rms_norm_kernel(
   auto out_ptr = out.data_ptr<scalar_t>();
   auto input_ptr = input.data_ptr<scalar_t>();
   auto weight_ptr = weight.data_ptr<scalar_t>();
-  sycl::range<3> grid(1, 1, num_tokens);
+  sycl::range<3> grid(1, 1, num_tokens); // each work-group handles one token
   sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
   auto& queue = vllm::xpu::vllmGetQueue();
   queue.submit([&](sycl::handler& cgh) {
@@ -121,12 +143,17 @@ class fused_add_rms_norm_kernel {
         hidden_size(hidden_size_),
         s_variance(s_variance_) {}
 
+  // TODO: No vectorized global memory load/store in this kernel, can it improve
+  // performance?
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     float* s_variance_ptr =
         s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
     float variance = 0.0f;
 
+    // Add the input and residual to get z
+    // compute z^2 and accumulate to variance
+    // store z back to residual
     for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
          idx += item_ct1.get_local_range(2)) {
       scalar_t z = (scalar_t)input[item_ct1.get_group(2) * input_stride + idx];
@@ -136,6 +163,7 @@ class fused_add_rms_norm_kernel {
       residual[item_ct1.get_group(2) * hidden_size + idx] = z;
     }
 
+    // reduce variance within the work-group, to get the total sum of z^2
     variance = sycl::reduce_over_group(
         sycl::ext::oneapi::this_work_item::get_work_group<3>(),
         variance,
@@ -178,7 +206,7 @@ void call_fused_add_rms_norm_kernel(
   auto residual_ptr = residual.data_ptr<scalar_t>();
   auto weight_ptr = weight.data_ptr<scalar_t>();
   int64_t input_stride = input.stride(-2);
-  sycl::range<3> grid(1, 1, num_tokens);
+  sycl::range<3> grid(1, 1, num_tokens); // each work-group handles one token
   sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
   auto& queue = vllm::xpu::vllmGetQueue();
   queue.submit([&](sycl::handler& cgh) {

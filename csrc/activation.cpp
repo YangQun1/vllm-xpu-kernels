@@ -104,6 +104,8 @@ class act_and_mul_kernel {
       const int d)
       : out_(out), input_(input), d_(d) {}
 
+  // TODO: No vectorized global memory load/store in this kernel, can it improve
+  // performance?
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     const int64_t token_idx = item_ct1.get_group(2);
