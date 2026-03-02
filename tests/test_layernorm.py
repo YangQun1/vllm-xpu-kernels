@@ -119,3 +119,68 @@ def test_rms_norm_uncontigous(
         torch.ops._C.rms_norm,
         (out, q_by_head, layer.weight.data, layer.variance_epsilon),
     )
+
+# The measured effective bandwidth on B60:
+# add_residual=False + strided_input=False:  390 GB/s
+# add_residual=False + strided_input=True:   154 GB/s, which is much lower than the non-strided case, TODO investigate further.
+# add_residual=True  + strided_input=False:  299 GB/s
+# add_residual=True  + strided_input=True:   294 GB/s
+@pytest.mark.parametrize("num_tokens", [8192*16])
+@pytest.mark.parametrize("hidden_size", [7168*2])
+@pytest.mark.parametrize("add_residual", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("seed", [0])
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("strided_input", [False, True])
+@torch.inference_mode()
+def test_rms_norm_profiling(
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+    strided_input: bool,
+) -> None:
+    # Note: torch.set_default_device("xpu:1") not works.
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+    layer = RMSNorm(hidden_size).to(dtype=dtype)
+    layer.weight.data.normal_(mean=1.0, std=0.1)
+    scale = 1 / (2 * hidden_size)
+    last_dim = 2 * hidden_size if strided_input else hidden_size
+    x = torch.randn(num_tokens, last_dim, dtype=dtype)
+    x = x[..., :hidden_size]
+    assert x.is_contiguous() != strided_input
+    x *= scale
+    residual = torch.randn_like(x) * scale if add_residual else None
+
+    # warmup
+    out = layer(x, residual)
+    if add_residual:
+        torch.fill_(out[0], 0)
+    else:
+        torch.fill_(out, 0)
+    torch.xpu.synchronize()
+
+    # benchmark
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    start.record()
+    NUM_ITER = 100
+    for _ in range(NUM_ITER):
+        out = layer(x, residual)
+    end.record()
+    torch.xpu.synchronize()
+    cost = start.elapsed_time(end) / 1e3
+    print("\nTotal time for {} iterations: {:.3f} seconds".format(NUM_ITER, cost))
+
+    if add_residual:
+        write_data_size = out[0].numel() * out[0].element_size() + out[1].numel() * out[1].element_size()
+    else:
+        write_data_size = out.numel() * out.element_size()
+        
+    read_data_size = x.numel() * x.element_size()
+    total_data_size = read_data_size + write_data_size
+    real_bandwidth = total_data_size * NUM_ITER / cost / 1e9
+    print("\nEffective bandwidth: {:.3f} GB/s".format(real_bandwidth))
