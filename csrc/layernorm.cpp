@@ -52,10 +52,10 @@ class rms_norm_kernel {
       const sycl::nd_item<3>& item_ct1) const {
     constexpr static int vec_size = 8;
 
-    if (input_stride % vec_size == 0) {
-      vectorized_process<vec_size>(item_ct1);
-      return;
-    }
+    // if (input_stride % vec_size == 0) {
+    //   vectorized_process<vec_size>(item_ct1);
+    //   return;
+    // }
 
     float* s_variance_ptr =
         s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -180,65 +180,65 @@ class rms_norm_kernel {
     }
   }
 
-  template<int vec_size>
-  void vectorized_process(const sycl::nd_item<3>& item_ct1) const {
-    using WideT = vec_t<scalar_t, vec_size>;
+  // template<int vec_size>
+  // void vectorized_process(const sycl::nd_item<3>& item_ct1) const {
+  //   using WideT = vec_t<scalar_t, vec_size>;
 
-    float* s_variance_ptr =
-        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float variance = 0.0f;
+  //   float* s_variance_ptr =
+  //       s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
+  //   float variance = 0.0f;
 
-    int vectorized_part_len = hidden_size / vec_size * vec_size;
+  //   int vectorized_part_len = hidden_size / vec_size * vec_size;
 
-    // Vectorized loading and variance computation
-    for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
-         idx += item_ct1.get_local_range(2)) {
-      WideT x_vec = *((const WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size));
-      #pragma unroll
-      for (int i = 0; i < vec_size; ++i) {
-        float x = (float)x_vec.data[i];
-        variance += x * x;
-      }
-    }
+  //   // Vectorized loading and variance computation
+  //   for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     WideT x_vec = *((const WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size));
+  //     #pragma unroll
+  //     for (int i = 0; i < vec_size; ++i) {
+  //       float x = (float)x_vec.data[i];
+  //       variance += x * x;
+  //     }
+  //   }
 
-    // Scalar processing for the remaining tail elements
-    for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      const float x = (float)input[item_ct1.get_group(2) * input_stride + idx];
-      variance += x * x;
-    }
+  //   // Scalar processing for the remaining tail elements
+  //   for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     const float x = (float)input[item_ct1.get_group(2) * input_stride + idx];
+  //     variance += x * x;
+  //   }
 
-    variance = sycl::reduce_over_group(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>(),
-        variance,
-        sycl::plus<>());
-    if (item_ct1.get_local_id(2) == 0) {
-      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
-    }
+  //   variance = sycl::reduce_over_group(
+  //       sycl::ext::oneapi::this_work_item::get_work_group<3>(),
+  //       variance,
+  //       sycl::plus<>());
+  //   if (item_ct1.get_local_id(2) == 0) {
+  //     *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
+  //   }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+  //   item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    // Vectorized loading and variance computation
-    for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
-         idx += item_ct1.get_local_range(2)) {
-      WideT x_vec = *((const WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size));
-      WideT out_vec;
-      #pragma unroll
-      for (int i = 0; i < vec_size; ++i) {
-        float x = (float)x_vec.data[i];
-        out_vec.data[i] = ((scalar_t)(x * (*s_variance_ptr))) * weight[idx * vec_size + i];
-      }
-      *((WideT*)(out + item_ct1.get_group(2) * hidden_size + idx * vec_size)) = out_vec;
-    }
+  //   // Vectorized loading and variance computation
+  //   for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     WideT x_vec = *((const WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size));
+  //     WideT out_vec;
+  //     #pragma unroll
+  //     for (int i = 0; i < vec_size; ++i) {
+  //       float x = (float)x_vec.data[i];
+  //       out_vec.data[i] = ((scalar_t)(x * (*s_variance_ptr))) * weight[idx * vec_size + i];
+  //     }
+  //     *((WideT*)(out + item_ct1.get_group(2) * hidden_size + idx * vec_size)) = out_vec;
+  //   }
 
-    // Scalar processing for the remaining tail elements
-    for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float x = (float)input[item_ct1.get_group(2) * input_stride + idx];
-      out[item_ct1.get_group(2) * hidden_size + idx] =
-          ((scalar_t)(x * (*s_variance_ptr))) * weight[idx];
-    }
-  }
+  //   // Scalar processing for the remaining tail elements
+  //   for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     float x = (float)input[item_ct1.get_group(2) * input_stride + idx];
+  //     out[item_ct1.get_group(2) * hidden_size + idx] =
+  //         ((scalar_t)(x * (*s_variance_ptr))) * weight[idx];
+  //   }
+  // }
 
  private:
   scalar_t* __restrict__ out;          // [..., hidden_size]
@@ -324,10 +324,10 @@ class fused_add_rms_norm_kernel {
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     constexpr static int vec_size = 8;
-    if (input_stride % vec_size == 0) {
-      vectorized_process<vec_size>(item_ct1);
-      return;
-    }
+    // if (input_stride % vec_size == 0) {
+    //   vectorized_process<vec_size>(item_ct1);
+    //   return;
+    // }
 
     float* s_variance_ptr =
         s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -360,71 +360,71 @@ class fused_add_rms_norm_kernel {
     }
   }
 
-  template<int vec_size>
-  void vectorized_process(const sycl::nd_item<3>& item_ct1) const {
-    using WideT = vec_t<scalar_t, vec_size>;
+  // template<int vec_size>
+  // void vectorized_process(const sycl::nd_item<3>& item_ct1) const {
+  //   using WideT = vec_t<scalar_t, vec_size>;
 
-    float* s_variance_ptr =
-        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float variance = 0.0f;
+  //   float* s_variance_ptr =
+  //       s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
+  //   float variance = 0.0f;
 
-    int vectorized_part_len = hidden_size / vec_size * vec_size;
+  //   int vectorized_part_len = hidden_size / vec_size * vec_size;
 
-    // Vectorized loading and variance computation
-    for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
-         idx += item_ct1.get_local_range(2)) {
-      WideT x_vec = *((const WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size));
-      WideT res_vec = *((const WideT*)(residual + item_ct1.get_group(2) * hidden_size + idx * vec_size));
-      #pragma unroll
-      for (int i = 0; i < vec_size; ++i) {
-        x_vec.data[i] += res_vec.data[i];
-        float x = (float)x_vec.data[i];
-        variance += x * x;
-      }
-      *((WideT*)(residual + item_ct1.get_group(2) * hidden_size + idx * vec_size)) = x_vec;
-    }
+  //   // Vectorized loading and variance computation
+  //   for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     WideT x_vec = *((const WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size));
+  //     WideT res_vec = *((const WideT*)(residual + item_ct1.get_group(2) * hidden_size + idx * vec_size));
+  //     #pragma unroll
+  //     for (int i = 0; i < vec_size; ++i) {
+  //       x_vec.data[i] += res_vec.data[i];
+  //       float x = (float)x_vec.data[i];
+  //       variance += x * x;
+  //     }
+  //     *((WideT*)(residual + item_ct1.get_group(2) * hidden_size + idx * vec_size)) = x_vec;
+  //   }
 
-    // Scalar processing for the remaining tail elements
-    for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      scalar_t z = (scalar_t)input[item_ct1.get_group(2) * input_stride + idx];
-      z += residual[item_ct1.get_group(2) * hidden_size + idx];
-      float x = (float)z;
-      variance += x * x;
-      residual[item_ct1.get_group(2) * hidden_size + idx] = z;
-    }
+  //   // Scalar processing for the remaining tail elements
+  //   for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     scalar_t z = (scalar_t)input[item_ct1.get_group(2) * input_stride + idx];
+  //     z += residual[item_ct1.get_group(2) * hidden_size + idx];
+  //     float x = (float)z;
+  //     variance += x * x;
+  //     residual[item_ct1.get_group(2) * hidden_size + idx] = z;
+  //   }
 
-    variance = sycl::reduce_over_group(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>(),
-        variance,
-        sycl::plus<>());
-    if (item_ct1.get_local_id(2) == 0) {
-      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
-    }
+  //   variance = sycl::reduce_over_group(
+  //       sycl::ext::oneapi::this_work_item::get_work_group<3>(),
+  //       variance,
+  //       sycl::plus<>());
+  //   if (item_ct1.get_local_id(2) == 0) {
+  //     *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
+  //   }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+  //   item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    // Vectorized loading and variance computation
-    for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
-         idx += item_ct1.get_local_range(2)) {
-      WideT x_vec = *((const WideT*)(residual + item_ct1.get_group(2) * hidden_size + idx * vec_size));
-      WideT out_vec;
-      #pragma unroll
-      for (int i = 0; i < vec_size; ++i) {
-        float x = (float)x_vec.data[i];
-        out_vec.data[i] = ((scalar_t)(x * (*s_variance_ptr))) * weight[idx * vec_size + i];
-      }
-      *((WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size)) = out_vec;
-    }
+  //   // Vectorized loading and variance computation
+  //   for (int idx = item_ct1.get_local_id(2); idx < vectorized_part_len / vec_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     WideT x_vec = *((const WideT*)(residual + item_ct1.get_group(2) * hidden_size + idx * vec_size));
+  //     WideT out_vec;
+  //     #pragma unroll
+  //     for (int i = 0; i < vec_size; ++i) {
+  //       float x = (float)x_vec.data[i];
+  //       out_vec.data[i] = ((scalar_t)(x * (*s_variance_ptr))) * weight[idx * vec_size + i];
+  //     }
+  //     *((WideT*)(input + item_ct1.get_group(2) * input_stride + idx * vec_size)) = out_vec;
+  //   }
 
-    // Scalar processing for the remaining tail elements
-    for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float x = (float)residual[item_ct1.get_group(2) * hidden_size + idx];
-      input[item_ct1.get_group(2) * input_stride + idx] =
-          ((scalar_t)(x * (*s_variance_ptr))) * weight[idx];
-    }
-  }
+  //   // Scalar processing for the remaining tail elements
+  //   for (int idx = vectorized_part_len + item_ct1.get_local_id(2); idx < hidden_size;
+  //        idx += item_ct1.get_local_range(2)) {
+  //     float x = (float)residual[item_ct1.get_group(2) * hidden_size + idx];
+  //     input[item_ct1.get_group(2) * input_stride + idx] =
+  //         ((scalar_t)(x * (*s_variance_ptr))) * weight[idx];
+  //   }
+  // }
 
  private:
   scalar_t* __restrict__ input;     // [..., hidden_size]
