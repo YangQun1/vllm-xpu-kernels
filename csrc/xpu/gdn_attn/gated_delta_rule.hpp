@@ -74,6 +74,11 @@ struct gated_delta_rule_kernel {
       return x;
   }
 
+  // This kernel computes the following equations iteratively for each token t:
+  // beta = b.sigmoid()
+  // g = exp(-exp(A_log) * softplus(a + dt_bias))
+  // S(t) = g(t)*S(t - 1) + (v(t) - g(t)*S(t - 1)*k(t))*beta(t)*k(t)
+  // O(t) = S(t) * q(t)
   [[sycl::reqd_sub_group_size(sub_group_size)]] void
   operator()(sycl::nd_item<3> item) const {
     int batch_id = item.get_group(0);
