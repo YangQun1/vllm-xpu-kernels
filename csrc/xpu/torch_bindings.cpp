@@ -79,6 +79,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "tp_size) -> ()");
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
 
+  xpu_ops.def(
+      "fp8_mqa_logits(Tensor q, Tensor kv, Tensor kv_scales, Tensor weights, "
+      "Tensor cu_seqlen_ks, Tensor cu_seqlen_ke) -> Tensor");
+  xpu_ops.impl("fp8_mqa_logits", torch::kXPU, &fp8_mqa_logits);
+
+  xpu_ops.def(
+      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache_fp8, Tensor "
+      "weights, Tensor context_lens, Tensor block_tables, Tensor? "
+      "schedule_metadata, int max_model_len) -> Tensor");
+  xpu_ops.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+
   // for empty tensor functions, we don't need dispatch key like torch::kXPU
   xpu_ops.def("is_bmg(int device_index) -> bool");
   xpu_ops.impl("is_bmg", &is_bmg);

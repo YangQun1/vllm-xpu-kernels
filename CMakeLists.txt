@@ -282,6 +282,7 @@ endif()
 set(ATTN_KERNEL_LIB_NAME "")
 set(GROUPED_GEMM_LIB_NAME "")
 set(GDN_ATTN_LIB_NAME "")
+set(MQA_LOGITS_LIB_NAME "")
 
 if(BUILD_SYCL_TLA_KERNELS)
 
@@ -304,9 +305,11 @@ if(BUILD_SYCL_TLA_KERNELS)
     add_subdirectory(csrc/xpu/grouped_gemm/xe_2)
     add_subdirectory(csrc/xpu/attn/xe_2)
     add_subdirectory(csrc/xpu/gdn_attn/xe_2)
+    add_subdirectory(csrc/xpu/mqa_logits/xe_2)
     list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_2")
     list(APPEND ATTN_KERNEL_LIB_NAME "attn_kernels_xe_2")
     list(APPEND GDN_ATTN_LIB_NAME "gdn_attn_kernels_xe_2")
+    list(APPEND MQA_LOGITS_LIB_NAME "mqa_logits_kernels_xe_2")
     list(APPEND SYCL_TLA_COMPILE_OPTIONS -DVLLM_XPU_ENABLE_XE2)
   endif()
   list(APPEND VLLM_GPU_COMPILE_FLAGS ${SYCL_TLA_COMPILE_OPTIONS})
@@ -416,6 +419,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/torch_bindings.cpp"
       "csrc/xpu/lora/lora_shrink.cpp"
       "csrc/xpu/lora/lora_expand.cpp"
+      "csrc/xpu/mqa_logits/mqa_logits_interface.cpp"
       "csrc/xpu/sycl/deepseek_scaling_rope.cpp"
       "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp"
       "csrc/xpu/utils.cpp"
@@ -452,7 +456,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     INCLUDE_DIRECTORIES
     ${VLLM_XPU_INCLUDE_DIR}
     LIBRARIES
-    ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME}
+    ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME};${MQA_LOGITS_LIB_NAME}
     USE_SABI
     3
     WITH_SOABI)

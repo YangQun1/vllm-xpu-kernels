@@ -91,7 +91,7 @@ class cmake_build_ext(build_ext):
     def compute_num_jobs(self):
         # `num_jobs` is either the value of the MAX_JOBS environment variable
         # (if defined) or the number of CPUs available.
-        num_jobs = envs.MAX_JOBS
+        num_jobs = 4 # envs.MAX_JOBS
         if num_jobs is not None:
             num_jobs = int(num_jobs)
             logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
@@ -302,6 +302,7 @@ additional_libraries = {
     "gdn_attn_kernels_xe_2": "/csrc/xpu/gdn_attn/xe_2",
     "grouped_gemm_xe_default": "/csrc/xpu/grouped_gemm/xe_default",
     "grouped_gemm_xe_2": "/csrc/xpu/grouped_gemm/xe_2",
+    "mqa_logits_kernels_xe_2": "/csrc/xpu/mqa_logits/xe_2",
 }
 
 if _build_custom_ops():
