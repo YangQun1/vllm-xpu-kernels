@@ -352,6 +352,12 @@ def test_fp8_mqa_logits_profiling():
     q_fp8 = q.to(torch.float8_e4m3fn)
     kv_fp8, kv_scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
+    NUM_WARMUP = 10
+    for _ in range(NUM_WARMUP):
+        torch.ops._xpu_C.fp8_mqa_logits(q_fp8, kv_fp8, kv_scales, weights, ks, ke)
+        triton_fp8_mqa_logits(q_fp8, (kv_fp8, kv_scales), weights, ks, ke)
+    torch.xpu.synchronize()
+
     NUM_ITER = 100
     import time
     print("\nProfiling fp8_mqa_logits kernels...")
