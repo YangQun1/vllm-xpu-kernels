@@ -57,6 +57,14 @@ torch::Tensor cutlass_grouped_gemm_interface(
     bool is_B_int4,
     bool is_B_mxfp4);
 
+torch::Tensor fp8_mqa_logits_cute(
+    torch::Tensor q,
+    torch::Tensor kv,
+    torch::Tensor kv_scale,
+    torch::Tensor weights,
+    torch::Tensor cu_seqlen_ks,
+    torch::Tensor cu_seqlen_ke);
+
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     const at::Tensor& positions,
     const at::Tensor& query,

@@ -45,6 +45,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       &cutlass_grouped_gemm_interface);
 
   xpu_ops.def(
+      "fp8_mqa_logits_cute(Tensor q, Tensor kv, Tensor kv_scale, Tensor "
+      "weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke) -> Tensor");
+  xpu_ops.impl("fp8_mqa_logits_cute", torch::kXPU, &fp8_mqa_logits_cute);
+
+  xpu_ops.def(
       "deepseek_scaling_rope(Tensor! positions, Tensor! query, Tensor! key, "
       "Tensor? offsets_opt, Tensor! cos_sin_cache, int rotary_dim, bool "
       "is_neox_style) "

@@ -34,7 +34,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
 
 # Supported Intel GPU architectures.
-set(SYCL_SUPPORTED_ARCHS "intel_gpu_pvc;intel_gpu_bmg_g21;intel_gpu_bmg_g31")
+set(SYCL_SUPPORTED_ARCHS "intel_gpu_bmg_g21")
 
 #
 # Supported/expected torch versions for XPU.
@@ -155,8 +155,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # VLLM_XPU_AOT_DEVICES and VLLM_XPU_XE2_AOT_DEVICES Example: export
   # VLLM_XPU_AOT_DEVICES="pvc,bmg-g21-a0" export
   # VLLM_XPU_XE2_AOT_DEVICES="pvc,bmg-g31-a0"
-  set(AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
-  set(XE2_AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
+  set(AOT_DEVICES "bmg-g21-a0")
+  set(XE2_AOT_DEVICES "bmg-g21-a0")
 
   # Allow overriding via env, including explicitly disabling AOT by setting an
   # empty env var (e.g. export VLLM_XPU_AOT_DEVICES="").
@@ -477,6 +477,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/lora/lora_shrink.cpp"
       "csrc/xpu/lora/lora_expand.cpp"
       "csrc/xpu/sycl/deepseek_scaling_rope.cpp"
+      "csrc/xpu/mqa_logits/fp8_mqa_logits_cute.cpp"
       "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp"
       "csrc/xpu/utils.cpp"
       "csrc/xpu/gdn_attn/gdn_attn_interface.cpp")
@@ -504,13 +505,14 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     SOURCES
     ${VLLM_EXT_XPU_SRC}
     COMPILE_FLAGS
-    ${VLLM_GPU_COMPILE_FLAGS}
+    ${VLLM_GPU_COMPILE_FLAGS};${VLLM_CUTLASS_FLAGS}
     LINK_FLAGS
     ${VLLM_GPU_LINK_FLAGS}
     ARCHITECTURES
     ${VLLM_GPU_ARCHES}
     INCLUDE_DIRECTORIES
     ${VLLM_XPU_INCLUDE_DIR}
+    ${SYCL_TLA_INCLUDE_DIRS}
     LIBRARIES
     ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME}
     USE_SABI
