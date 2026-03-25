@@ -378,4 +378,91 @@ CUTE_DEVICE void gemm_TTS_k_multi(
   }
 }
 
+template <
+    class ATensor,
+    class BTensor,
+    class SGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_SmemTTS(
+    ATensor const& A,  // (M,K), A stored in SLM
+    BTensor const& B,  // (N,K), B stored in GMEM
+    SGCTensor& tCrC,   // (M,N)
+    int wg_m,          // m tile start id
+    int wg_n,          // n tile start id
+    TiledMMA const& mma) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+  Tensor cB = make_identity_tensor(B.shape());
+
+  auto wg_tile = mma.tile_mnk();
+  Tensor gA = local_tile(
+    cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(
+      cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
+
+  auto copy_Y = get_block_2d_copy_A<void>(
+    mma,
+    make_tensor(
+      make_gmem_ptr(static_cast<typename ATensor::element_type*>(nullptr)),
+      make_layout(shape(A))));
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+
+  using SLMALoadAtom =
+      Copy_Atom<UniversalCopy<typename ATensor::element_type>,
+                typename ATensor::element_type>;
+  using SLMALoadTiler = typename decltype(copy_Y)::Tiler_MN;
+  using SLMALoadTV = typename decltype(copy_Y)::TiledLayout_TV;
+  auto slm_a_load = TiledCopy<SLMALoadAtom, SLMALoadTV, SLMALoadTiler>{};
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_Y = copy_Y.get_slice(local_id);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+  auto thr_slm_a_load = slm_a_load.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tArA = thr_copy_Y.partition_sg_fragment_D(gA(_, _, 0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tIrA = thr_slm_a_load.retile_D(tArA);
+  Tensor tIsA = thr_slm_a_load.partition_S(A);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  const int prefetch_dist = 3;
+  constexpr int barrier_scope = 2;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(slm_a_load, tIsA(_, _, k_tile), tIrA(_, _, 0));
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
+
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+
+    barrier_wait(barrier_scope);
+  }
+}
+
 }  // namespace gdn

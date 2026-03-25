@@ -918,6 +918,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
 template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_fwd_o_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,  // [3 * chunk_size]
+  const sycl::local_accessor<T, 1>& o2_slm_const,  // [chunk_size * chunk_size]
     T* core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
     T* A,  // [num_v_heads, total_virtual_seqlen, chunk_size], temp O2 buffer
     T* w,  // [num_v_heads, total_virtual_seqlen, head_k_dim]
@@ -939,6 +940,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const int head_v_dim) {
   (void)A_log;
   (void)dt_bias;
+  (void)A;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int local_id = item.get_local_linear_id();
@@ -951,6 +953,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
   float* slm_mem = static_cast<float*>(
       slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
+          .get());
+  T* o2_slm_ptr = static_cast<T*>(
+      o2_slm_const.template get_multi_ptr<sycl::access::decorated::no>()
           .get());
   float* g_slm_ptr = slm_mem;
   float* g_multi_slm_ptr = slm_mem + chunk_size;
@@ -1032,6 +1037,12 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       }
       item.barrier(sycl::access::fence_space::local_space);
 
+      CUTE_UNROLL
+      for (int e = local_id; e < chunk_size * chunk_size; e += local_range) {
+        o2_slm_ptr[e] = static_cast<T>(0);
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+
       auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
                    virtual_seq_offset * head_k_dim;
       auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
@@ -1063,6 +1074,10 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto thr_mma = mma.get_slice(local_id);
 
       if (has_prev_state) {
+        // U shape: [chunk_size, head_v_dim]
+        // W shape: [chunk_size, head_k_dim]
+        // S shape: [head_v_dim, head_k_dim]
+        // [chunk_size, head_k_dim] * [head_v_dim, head_k_dim]^T = [chunk_size, head_v_dim]
         for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
           Tensor gU_C =
               local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -1106,24 +1121,37 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_layout(
               K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-      auto O2_ptr =
-          A +
-          static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
-          virtual_seq_offset * chunk_size;
-      auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
+      auto O2_tensor_store_shape = make_shape(current_chunk_size, chunk_size);
+      auto O2_tensor_store = make_tensor(
+        make_smem_ptr(o2_slm_ptr),
+        make_layout(O2_tensor_store_shape, make_stride(chunk_size, _1{})));
       auto O2_tensor = make_tensor(
-          make_gmem_ptr(O2_ptr),
-          make_layout(O2_tensor_shape, make_stride(chunk_size, _1{})));
-      Tensor cO2 = make_identity_tensor(O2_tensor_shape);
-      auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
+        make_smem_ptr(o2_slm_ptr),
+        make_layout(
+          make_shape(chunk_size, chunk_size), make_stride(chunk_size, _1{})));
+      Tensor cO2 = make_identity_tensor(O2_tensor_store_shape);
+      auto copy_O2_c = get_block_2d_copy_D<void>(
+        mma,
+        make_tensor(
+        make_gmem_ptr(static_cast<T*>(nullptr)), O2_tensor_store.layout()));
       auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
+
+      using O2StoreAtom = Copy_Atom<UniversalCopy<T>, T>;
+      using O2StoreTiler = typename decltype(copy_O2_c)::Tiler_MN;
+      using O2StoreTV = typename decltype(copy_O2_c)::TiledLayout_TV;
+      auto o2_slm_store = TiledCopy<O2StoreAtom, O2StoreTV, O2StoreTiler>{};
+      auto thr_o2_slm_store = o2_slm_store.get_slice(local_id);
 
       Tensor gO2_C =
           local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
       auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gO2_C);
-      auto tCgO2_c = thr_copy_O2_c.partition_D(gO2_C);
       auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
+      auto tOrO2 = thr_o2_slm_store.retile_S(tCrO2_c);
+      auto tOsO2 = thr_o2_slm_store.partition_D(O2_tensor_store);
 
+      // Q shape: [current_chunk_size, head_k_dim]
+      // K shape: [chunk_size, head_k_dim]
+      // [current_chunk_size, head_k_dim] * [chunk_size, head_k_dim]^T = [current_chunk_size, chunk_size]
       clear(tSrO2_c);
       gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
 
@@ -1144,7 +1172,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         }
       }
       reorder(tSrO2_c, tCrO2_c);
-      copy(copy_O2_c, tCrO2_c, tCgO2_c);
+      copy(o2_slm_store, tOrO2, tOsO2);
 
       // barrier to make sure O2 is visible to afterward O compute
       item.barrier(sycl::access::fence_space::local_space);
@@ -1166,6 +1194,12 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto thr_copy_O_c = copy_O_c.get_slice(local_id);
 
       if (has_prev_state) {
+        // Q shape: [current_chunk_size, head_k_dim]
+        // S shape: [head_v_dim, head_k_dim]
+        // O2 shape: [current_chunk_size, chunk_size]
+        // UT shape: [head_v_dim, chunk_size]
+        // Q*S: [current_chunk_size, head_k_dim] * [head_v_dim, head_k_dim]^T = [current_chunk_size, head_v_dim]
+        // O2*UT: [current_chunk_size, chunk_size] * [head_v_dim, chunk_size]^T = [current_chunk_size, head_v_dim]
         for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
           Tensor gO_C =
               local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -1185,7 +1219,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               tSrO_c(sn * SG_M + sm) *= g_exp_slm_ptr[(m_idx)];
             }
           }
-          gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          gemm_SmemTTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
@@ -1198,7 +1232,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
 
           clear(tSrO_c);
-          gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          gemm_SmemTTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
@@ -1503,16 +1537,20 @@ void kernel_launcher(
   sycl::range<3> local_fwd_o(1, 1, MaxThreadsPerWorkgroupFwdO);
   sycl::range<3> global_fwd_o(batch_size, num_v_heads, 1);
   int slm_size_fwd_o = chunk_size + chunk_size + chunk_size;
+  int slm_size_fwd_o_o2 = chunk_size * chunk_size;
 
   auto event_fwd_o = queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_fwd_o), cgh);
+    sycl::local_accessor<T, 1> local_mem_o2(
+        sycl::range<1>(slm_size_fwd_o_o2), cgh);
     cgh.parallel_for<ChunkFwdOKernel<T, StateT>>(
         sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o},
         kernel_props,
         [=](auto) {
           chunk_fwd_o_kernel<T, StateT, MMAFwdO>(
               local_mem,
+              local_mem_o2,
               core_attn_out,
               A,
               w,
