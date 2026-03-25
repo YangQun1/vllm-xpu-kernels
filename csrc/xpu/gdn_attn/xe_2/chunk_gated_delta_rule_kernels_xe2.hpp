@@ -1033,14 +1033,14 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       item.barrier(sycl::access::fence_space::local_space);
 
       auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
-              virtual_seq_offset * head_k_dim;
+                   virtual_seq_offset * head_k_dim;
       auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
       auto W_tensor = make_tensor(
           make_gmem_ptr(W_ptr),
           make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
 
       auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim +
-              virtual_seq_offset * head_v_dim;
+                   virtual_seq_offset * head_v_dim;
       auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
       auto U_tensor = make_tensor(
           make_gmem_ptr(U_ptr),
