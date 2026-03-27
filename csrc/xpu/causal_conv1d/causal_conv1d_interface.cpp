@@ -1,5 +1,6 @@
 #include "xpu/causal_conv1d/causal_conv1d.hpp"
 
+#include <cstdint>
 #include <vector>
 
 #include "utils.h"
@@ -100,7 +101,9 @@ void launch_fwd(
       static_cast<int>(batch_ptr.size(0)), dim);
 
   queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> smem_x((kBlockM + state_len) * kBlockN, cgh);
+    sycl::local_accessor<scalar_t, 1> smem_x(
+        (kBlockM + state_len) * kBlockN,
+        cgh);
     causal_conv1d_fwd_kernel<scalar_t, kBlockM, kBlockN, WIDTH> task(
         reinterpret_cast<scalar_t*>(out.data_ptr()),
         reinterpret_cast<const scalar_t*>(x.data_ptr()),
@@ -134,6 +137,85 @@ void launch_fwd(
         true,
         act_mode,
         smem_x);
+    cgh.parallel_for(nd_range, task);
+  });
+}
+
+template <typename scalar_t, int WIDTH>
+void launch_fwd_channellast(
+    sycl::queue& queue,
+    torch::Tensor& out,
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const torch::Tensor& batch_ptr,
+    const torch::Tensor& token_chunk_offset_ptr,
+    int64_t pad_slot_id,
+    ActMode act_mode) {
+  const int dim = static_cast<int>(x.size(0));
+  const int width = static_cast<int>(weight.size(1));
+  const int state_len = width - 1;
+  const int num_cache_lines = static_cast<int>(conv_states.size(0));
+  const int sx_tok = static_cast<int>(x.stride(1));
+  const int sw_dim = static_cast<int>(weight.stride(0));
+  const int sw_w = static_cast<int>(weight.stride(1));
+  const int ss_seq = static_cast<int>(conv_states.stride(0));
+  const int ss_dim = static_cast<int>(conv_states.stride(1));
+  const int ss_tok = static_cast<int>(conv_states.stride(2));
+  const int sci = static_cast<int>(cache_indices.stride(0));
+  const int so_tok = static_cast<int>(out.stride(1));
+  const int pad_slot_id_i32 = static_cast<int>(pad_slot_id);
+
+  auto nd_range =
+      causal_conv1d_channellast_fwd_kernel<
+          scalar_t,
+          kBlockM,
+          kBlockN,
+          WIDTH>::get_nd_range(static_cast<int>(batch_ptr.size(0)), dim);
+
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<scalar_t, 1> smem_x(
+        (kBlockM + state_len) * kBlockN,
+        cgh);
+    causal_conv1d_channellast_fwd_kernel<
+        scalar_t,
+        kBlockM,
+        kBlockN,
+        WIDTH>
+        task(
+            reinterpret_cast<scalar_t*>(out.data_ptr()),
+            reinterpret_cast<const scalar_t*>(x.data_ptr()),
+            reinterpret_cast<const scalar_t*>(weight.data_ptr()),
+            bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr())
+                             : nullptr,
+            reinterpret_cast<scalar_t*>(conv_states.data_ptr()),
+            reinterpret_cast<const int32_t*>(query_start_loc.data_ptr()),
+            reinterpret_cast<const int32_t*>(cache_indices.data_ptr()),
+            has_initial_state.has_value()
+                ? reinterpret_cast<const bool*>(has_initial_state->data_ptr())
+                : nullptr,
+            reinterpret_cast<const int32_t*>(batch_ptr.data_ptr()),
+            reinterpret_cast<const int32_t*>(token_chunk_offset_ptr.data_ptr()),
+            dim,
+            state_len,
+            num_cache_lines,
+            sx_tok,
+            sw_dim,
+            sw_w,
+            ss_seq,
+            ss_dim,
+            ss_tok,
+            sci,
+            so_tok,
+            pad_slot_id_i32,
+            bias.has_value(),
+            true,
+            act_mode,
+            smem_x);
     cgh.parallel_for(nd_range, task);
   });
 }
@@ -280,13 +362,45 @@ torch::Tensor causal_conv1d_fwd(
   }
 
   auto act_mode = parse_act_mode(activation);
+  const int dim = static_cast<int>(x.size(0));
   const int width = static_cast<int>(weight.size(1));
+  const bool is_channel_last = (x.stride(0) == 1) && (x.stride(1) > 1);
 
   auto original_dtype = x.scalar_type();
   torch::Tensor x_cast = x.to(conv_states.scalar_type());
   torch::Tensor out = torch::empty_like(x_cast);
-    torch::Tensor query_start_loc_i32 = query_start_loc.to(torch::kInt32);
-    torch::Tensor cache_indices_i32 = cache_indices.to(torch::kInt32);
+  torch::Tensor query_start_loc_i32 = query_start_loc.to(torch::kInt32);
+  torch::Tensor cache_indices_i32 = cache_indices.to(torch::kInt32);
+
+  constexpr int kVec = 4;
+  const int elem_size = static_cast<int>(x_cast.element_size());
+  const int vec_bytes = kVec * elem_size;
+  auto is_ptr_aligned = [&](const torch::Tensor& tensor) {
+    const auto addr = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+    return (addr % static_cast<uintptr_t>(vec_bytes)) == 0;
+  };
+
+  const bool can_vec_x = (x_cast.stride(1) % kVec == 0) && is_ptr_aligned(x_cast);
+  const bool can_vec_o = (out.stride(1) % kVec == 0) && is_ptr_aligned(out);
+  const bool can_vec_state =
+      (conv_states.stride(0) % kVec == 0) &&
+      (conv_states.stride(1) == 1) &&
+      (conv_states.stride(2) % kVec == 0) &&
+      is_ptr_aligned(conv_states);
+
+  const bool weight_stride_ok =
+      (weight.stride(1) == 1) && ((width < 4) || (weight.stride(0) % kVec == 0));
+    const bool can_vec_weight =
+      weight_stride_ok && ((width < 4) || is_ptr_aligned(weight));
+
+  const bool use_channellast_vec_path =
+      is_channel_last &&
+      (out.stride(0) == 1) &&
+      (dim % kVec == 0) &&
+      can_vec_x &&
+      can_vec_o &&
+      can_vec_state &&
+      can_vec_weight;
 
   auto [batch_ptr, token_chunk_offset_ptr] =
       build_program_meta(
@@ -297,20 +411,39 @@ torch::Tensor causal_conv1d_fwd(
 
   auto& queue = vllm::xpu::vllmGetQueue();
 #define LAUNCH_FWD_CALL(scalar_t_, W_)                                        \
-  launch_fwd<scalar_t_, W_>(                                                  \
-      queue,                                                                   \
-      out,                                                                     \
-      x_cast,                                                                  \
-      weight,                                                                  \
-      bias,                                                                    \
-      conv_states,                                                             \
-      query_start_loc_i32,                                                     \
-      cache_indices_i32,                                                       \
-      has_initial_state,                                                       \
-      batch_ptr,                                                               \
-      token_chunk_offset_ptr,                                                  \
-      pad_slot_id,                                                             \
-      act_mode)
+  do {                                                                         \
+    if (use_channellast_vec_path) {                                            \
+      launch_fwd_channellast<scalar_t_, W_>(                                   \
+          queue,                                                                \
+          out,                                                                  \
+          x_cast,                                                               \
+          weight,                                                               \
+          bias,                                                                 \
+          conv_states,                                                          \
+          query_start_loc_i32,                                                  \
+          cache_indices_i32,                                                    \
+          has_initial_state,                                                    \
+          batch_ptr,                                                            \
+          token_chunk_offset_ptr,                                               \
+          pad_slot_id,                                                          \
+          act_mode);                                                            \
+    } else {                                                                    \
+      launch_fwd<scalar_t_, W_>(                                               \
+          queue,                                                                \
+          out,                                                                  \
+          x_cast,                                                               \
+          weight,                                                               \
+          bias,                                                                 \
+          conv_states,                                                          \
+          query_start_loc_i32,                                                  \
+          cache_indices_i32,                                                    \
+          has_initial_state,                                                    \
+          batch_ptr,                                                            \
+          token_chunk_offset_ptr,                                               \
+          pad_slot_id,                                                          \
+          act_mode);                                                            \
+    }                                                                           \
+  } while (0)
 
 #define DISPATCH_FWD_WIDTH(scalar_t_)                                         \
   switch (width) {                                                            \
