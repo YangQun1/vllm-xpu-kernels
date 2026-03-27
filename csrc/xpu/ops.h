@@ -91,6 +91,31 @@ void gdn_attention(
     const int64_t tp_size,
     const bool reorder_input);
 
+torch::Tensor causal_conv1d_fwd(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::string& activation,
+    int64_t pad_slot_id,
+    bool validate_data);
+
+torch::Tensor causal_conv1d_update(
+    const torch::Tensor& x,
+    torch::Tensor& conv_state,
+    const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias,
+    const std::string& activation,
+    const torch::Tensor& conv_state_indices,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const std::optional<torch::Tensor>& query_start_loc,
+    int64_t max_query_len,
+    int64_t pad_slot_id,
+    bool validate_data);
+
 bool is_bmg(int64_t device_index);
 
 bool is_pvc(int64_t device_index);

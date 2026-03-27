@@ -79,6 +79,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "tp_size, bool reorder_input) -> ()");
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
 
+  xpu_ops.def(
+      "causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, "
+      "Tensor! conv_states, Tensor query_start_loc, Tensor cache_indices, "
+      "Tensor? has_initial_state, str activation, int pad_slot_id, bool "
+      "validate_data) -> Tensor");
+  xpu_ops.impl("causal_conv1d_fwd", torch::kXPU, &causal_conv1d_fwd);
+
+  xpu_ops.def(
+      "causal_conv1d_update(Tensor x, Tensor! conv_state, Tensor "
+      "weight, Tensor? bias, str activation, Tensor conv_state_indices, "
+      "Tensor? num_accepted_tokens, Tensor? query_start_loc, int "
+      "max_query_len, int pad_slot_id, bool validate_data) -> Tensor");
+  xpu_ops.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
+
   // for empty tensor functions, we don't need dispatch key like torch::kXPU
   xpu_ops.def("is_bmg(int device_index) -> bool");
   xpu_ops.impl("is_bmg", &is_bmg);
