@@ -5,7 +5,7 @@
 
 namespace vllm::xpu::causal_conv1d {
 
-constexpr int channel_last_fwd_vec_size = 4;
+constexpr int channel_last_fwd_vec_size = 2;
 
 enum class ActMode {
   none = 0,
@@ -396,36 +396,68 @@ struct causal_conv1d_channellast_fwd_kernel {
     item.barrier(sycl::access::fence_space::local_space);
 
 
-    const int feat = feat_group * BLOCK_N + local_id;
-    const bool feat_valid = (feat < dim);
-    if (feat_valid) {
-      // Load bias of current channel to register
-      const float bias_val =
-          (has_bias && bias != nullptr) ? static_cast<float>(bias[feat]) : 0.0f;
+    // Parallelize convolution along M: split token positions across workitems
+    // that share the same vec_idx channel group.
+    const int m_parallel = wg_size / vec_channels;
+    const int vec_idx = local_id % vec_channels;
+    const int m_lane = local_id / vec_channels;
+    {
+      const int feat_base = feat_group * BLOCK_N + vec_idx * vec_size;
+      if (feat_base < dim) {
+        float w_reg[WIDTH][vec_size];
+        vec_t bias_vec;
 
-      // Load weights of current channel to register
-      float w_reg[WIDTH];
-      const T* w_base = weight + feat * stride_w_dim;
+        // load bias
+        if (has_bias && bias != nullptr) {
+          bias_vec.load(0, bias + feat_base);
+        } else {
 #pragma unroll
-      for (int k = 0; k < WIDTH; ++k) {
-        w_reg[k] = static_cast<float>(w_base[k * stride_w_width]);
-      }
+          for (int lane = 0; lane < vec_size; ++lane) {
+            bias_vec[lane] = 0.0f;
+          }
+        }
 
-      // Do convolution and activation, and store results to shared memory first
-      for (int t = 0; t < segment_len; ++t) {
-        float acc = bias_val;
+        // load weights
 #pragma unroll
         for (int k = 0; k < WIDTH; ++k) {
-          const T xv = smem_ptr[(t + k) * BLOCK_N + local_id];
-          acc += static_cast<float>(xv) * w_reg[k];
+#pragma unroll
+          for (int lane = 0; lane < vec_size; ++lane) {
+            const int feat = feat_base + lane;
+            w_reg[k][lane] = static_cast<float>(
+                weight[feat * stride_w_dim + k]);
+          }
         }
 
-        if (act_mode == ActMode::silu) {
-          act_silu(acc);
-        } else if (act_mode == ActMode::swish) {
-          act_swish(acc);
+        // Do convolution and activation for the assigned M-lane.
+        for (int t = m_lane; t < segment_len; t += m_parallel) {
+          float acc[vec_size];
+#pragma unroll
+          for (int lane = 0; lane < vec_size; ++lane) {
+            acc[lane] = static_cast<float>(bias_vec[lane]);
+          }
+
+#pragma unroll
+          for (int k = 0; k < WIDTH; ++k) {
+            vec_t xv_vec;
+            xv_vec.load((t + k) * vec_stride + vec_idx, smem_ptr);
+#pragma unroll
+            for (int lane = 0; lane < vec_size; ++lane) {
+              acc[lane] += static_cast<float>(xv_vec[lane]) * w_reg[k][lane];
+            }
+          }
+
+          vec_t out_vec{};
+#pragma unroll
+          for (int lane = 0; lane < vec_size; ++lane) {
+            if (act_mode == ActMode::silu) {
+              act_silu(acc[lane]);
+            } else if (act_mode == ActMode::swish) {
+              act_swish(acc[lane]);
+            }
+            out_vec[lane] = static_cast<T>(acc[lane]);
+          }
+          out_vec.store(t * vec_stride + vec_idx, smem_ptr);
         }
-        smem_ptr[t * BLOCK_N + local_id] = static_cast<T>(acc);
       }
     }
     item.barrier(sycl::access::fence_space::local_space);
