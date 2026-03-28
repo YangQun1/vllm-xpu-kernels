@@ -372,35 +372,33 @@ torch::Tensor causal_conv1d_fwd(
   torch::Tensor query_start_loc_i32 = query_start_loc.to(torch::kInt32);
   torch::Tensor cache_indices_i32 = cache_indices.to(torch::kInt32);
 
-  constexpr int kVec = 4;
   const int elem_size = static_cast<int>(x_cast.element_size());
-  const int vec_bytes = kVec * elem_size;
-  auto is_ptr_aligned = [&](const torch::Tensor& tensor) {
+  auto is_ptr_aligned = [&](const torch::Tensor& tensor, int vec_size) {
+    const int vec_bytes = vec_size * elem_size;
     const auto addr = reinterpret_cast<uintptr_t>(tensor.data_ptr());
     return (addr % static_cast<uintptr_t>(vec_bytes)) == 0;
   };
+  auto can_use_vec = [&](int vec_size) {
+    if (!is_channel_last || out.stride(0) != 1) {
+      return false;
+    }
+    if (dim % vec_size != 0) {
+      return false;
+    }
+    const bool can_vec_x =
+        (x_cast.stride(1) % vec_size == 0) && is_ptr_aligned(x_cast, vec_size);
+    const bool can_vec_o =
+        (out.stride(1) % vec_size == 0) && is_ptr_aligned(out, vec_size);
+    const bool can_vec_state =
+        (conv_states.stride(0) % vec_size == 0) &&
+        (conv_states.stride(1) == 1) &&
+        (conv_states.stride(2) % vec_size == 0) &&
+        is_ptr_aligned(conv_states, vec_size);
+    return can_vec_x && can_vec_o && can_vec_state;
+  };
 
-  const bool can_vec_x = (x_cast.stride(1) % kVec == 0) && is_ptr_aligned(x_cast);
-  const bool can_vec_o = (out.stride(1) % kVec == 0) && is_ptr_aligned(out);
-  const bool can_vec_state =
-      (conv_states.stride(0) % kVec == 0) &&
-      (conv_states.stride(1) == 1) &&
-      (conv_states.stride(2) % kVec == 0) &&
-      is_ptr_aligned(conv_states);
-
-  const bool weight_stride_ok =
-      (weight.stride(1) == 1) && ((width < 4) || (weight.stride(0) % kVec == 0));
-    const bool can_vec_weight =
-      weight_stride_ok && ((width < 4) || is_ptr_aligned(weight));
-
-  const bool use_channellast_vec_path =
-      is_channel_last &&
-      (out.stride(0) == 1) &&
-      (dim % kVec == 0) &&
-      can_vec_x &&
-      can_vec_o &&
-      can_vec_state &&
-      can_vec_weight;
+  constexpr int kChannelLastVecSize = channel_last_fwd_vec_size;
+  const bool use_channellast_vec_path = can_use_vec(kChannelLastVecSize);
 
   auto [batch_ptr, token_chunk_offset_ptr] =
       build_program_meta(

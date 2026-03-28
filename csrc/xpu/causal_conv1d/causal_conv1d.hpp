@@ -5,6 +5,8 @@
 
 namespace vllm::xpu::causal_conv1d {
 
+constexpr int channel_last_fwd_vec_size = 4;
+
 enum class ActMode {
   none = 0,
   silu = 1,
@@ -239,7 +241,7 @@ struct causal_conv1d_channellast_fwd_kernel {
   static constexpr int sub_group_size = 32;
   static constexpr int sg_num = 4;
   static constexpr int wg_size = sub_group_size * sg_num;
-  static constexpr int vec_size = 4;
+  static constexpr int vec_size = channel_last_fwd_vec_size;
   using vec_t = sycl::vec<T, vec_size>;
 
   causal_conv1d_channellast_fwd_kernel(
@@ -295,6 +297,9 @@ struct causal_conv1d_channellast_fwd_kernel {
         use_pad_slot(use_pad_slot),
         act_mode(act_mode),
         smem_x(smem_x) {
+      static_assert(
+        vec_size == 1 || vec_size == 2 || vec_size == 4 || vec_size == 8,
+        "VLLM_XPU_CAUSAL_CONV1D_CL_VEC_SIZE must be one of {1,2,4,8}");
     static_assert(BLOCK_N == wg_size, "BLOCK_N must match wg_size for SGNUM=4 layout");
     static_assert(BLOCK_N % vec_size == 0, "BLOCK_N must be divisible by vec_size");
   }
@@ -398,21 +403,11 @@ struct causal_conv1d_channellast_fwd_kernel {
           (has_bias && bias != nullptr) ? static_cast<float>(bias[feat]) : 0.0f;
 
       // Load weights of current channel to register
-      T w_reg[WIDTH];
-      int k = 0;
+      float w_reg[WIDTH];
       const T* w_base = weight + feat * stride_w_dim;
-      if constexpr (WIDTH >= 4) {
-        vec_t w_vec;
-        w_vec.load(0, w_base);
-        w_reg[0] = w_vec[0];
-        w_reg[1] = w_vec[1];
-        w_reg[2] = w_vec[2];
-        w_reg[3] = w_vec[3];
-        k = 4;
-      }
 #pragma unroll
-      for (; k < WIDTH; ++k) {
-        w_reg[k] = w_base[k * stride_w_width];
+      for (int k = 0; k < WIDTH; ++k) {
+        w_reg[k] = static_cast<float>(w_base[k * stride_w_width]);
       }
 
       // Do convolution and activation, and store results to shared memory first
@@ -421,7 +416,7 @@ struct causal_conv1d_channellast_fwd_kernel {
 #pragma unroll
         for (int k = 0; k < WIDTH; ++k) {
           const T xv = smem_ptr[(t + k) * BLOCK_N + local_id];
-          acc += static_cast<float>(xv * w_reg[k]);
+          acc += static_cast<float>(xv) * w_reg[k];
         }
 
         if (act_mode == ActMode::silu) {
