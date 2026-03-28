@@ -366,13 +366,9 @@ torch::Tensor causal_conv1d_fwd(
   const int width = static_cast<int>(weight.size(1));
   const bool is_channel_last = (x.stride(0) == 1) && (x.stride(1) > 1);
 
-  auto original_dtype = x.scalar_type();
-  torch::Tensor x_cast = x.to(conv_states.scalar_type());
-  torch::Tensor out = torch::empty_like(x_cast);
-  torch::Tensor query_start_loc_i32 = query_start_loc.to(torch::kInt32);
-  torch::Tensor cache_indices_i32 = cache_indices.to(torch::kInt32);
+  torch::Tensor out = torch::empty_like(x);
 
-  const int elem_size = static_cast<int>(x_cast.element_size());
+  const int elem_size = static_cast<int>(x.element_size());
   auto is_ptr_aligned = [&](const torch::Tensor& tensor, int vec_size) {
     const int vec_bytes = vec_size * elem_size;
     const auto addr = reinterpret_cast<uintptr_t>(tensor.data_ptr());
@@ -386,7 +382,7 @@ torch::Tensor causal_conv1d_fwd(
       return false;
     }
     const bool can_vec_x =
-        (x_cast.stride(1) % vec_size == 0) && is_ptr_aligned(x_cast, vec_size);
+        (x.stride(1) % vec_size == 0) && is_ptr_aligned(x, vec_size);
     const bool can_vec_o =
         (out.stride(1) % vec_size == 0) && is_ptr_aligned(out, vec_size);
     const bool can_vec_state =
@@ -402,7 +398,7 @@ torch::Tensor causal_conv1d_fwd(
 
   auto [batch_ptr, token_chunk_offset_ptr] =
       build_program_meta(
-        query_start_loc_i32,
+        query_start_loc,
         static_cast<int32_t>(pad_slot_id),
         kBlockM,
         x.device());
@@ -414,12 +410,12 @@ torch::Tensor causal_conv1d_fwd(
       launch_fwd_channellast<scalar_t_, W_>(                                   \
           queue,                                                                \
           out,                                                                  \
-          x_cast,                                                               \
+          x,                                                                    \
           weight,                                                               \
           bias,                                                                 \
           conv_states,                                                          \
-          query_start_loc_i32,                                                  \
-          cache_indices_i32,                                                    \
+          query_start_loc,                                                      \
+          cache_indices,                                                        \
           has_initial_state,                                                    \
           batch_ptr,                                                            \
           token_chunk_offset_ptr,                                               \
@@ -429,12 +425,12 @@ torch::Tensor causal_conv1d_fwd(
       launch_fwd<scalar_t_, W_>(                                               \
           queue,                                                                \
           out,                                                                  \
-          x_cast,                                                               \
+          x,                                                                    \
           weight,                                                               \
           bias,                                                                 \
           conv_states,                                                          \
-          query_start_loc_i32,                                                  \
-          cache_indices_i32,                                                    \
+          query_start_loc,                                                      \
+          cache_indices,                                                        \
           has_initial_state,                                                    \
           batch_ptr,                                                            \
           token_chunk_offset_ptr,                                               \
@@ -461,9 +457,9 @@ torch::Tensor causal_conv1d_fwd(
       TORCH_CHECK(false, "causal_conv1d_fwd only supports width in {2,3,4,5}, got ", width); \
   }
 
-  if (x_cast.scalar_type() == at::kBFloat16) {
+  if (x.scalar_type() == at::kBFloat16) {
     DISPATCH_FWD_WIDTH(sycl::ext::oneapi::bfloat16)
-  } else if (x_cast.scalar_type() == at::kHalf) {
+  } else if (x.scalar_type() == at::kHalf) {
     DISPATCH_FWD_WIDTH(sycl::half)
   } else {
     DISPATCH_FWD_WIDTH(float)
@@ -471,7 +467,7 @@ torch::Tensor causal_conv1d_fwd(
 #undef DISPATCH_FWD_WIDTH
 #undef LAUNCH_FWD_CALL
 
-  return out.to(original_dtype);
+  return out;
 }
 
 torch::Tensor causal_conv1d_update(
@@ -501,24 +497,13 @@ torch::Tensor causal_conv1d_update(
   TORCH_CHECK(conv_state.dim() == 3, "conv_state must be 3D");
   TORCH_CHECK(conv_state_indices.dim() == 1, "conv_state_indices must be 1D");
 
-  auto original_dtype = x.scalar_type();
-  torch::Tensor x_cast = x.to(conv_state.scalar_type());
-  torch::Tensor conv_state_indices_i32 = conv_state_indices.to(torch::kInt32);
-  std::optional<torch::Tensor> num_accepted_tokens_i32 = std::nullopt;
-  if (num_accepted_tokens.has_value()) {
-    num_accepted_tokens_i32 = num_accepted_tokens->to(torch::kInt32);
-  }
-  std::optional<torch::Tensor> query_start_loc_i32 = std::nullopt;
-  if (query_start_loc.has_value()) {
-    query_start_loc_i32 = query_start_loc->to(torch::kInt32);
-  }
-
-  bool unsqueeze = !query_start_loc.has_value() && x_cast.dim() == 2;
+  bool unsqueeze = !query_start_loc.has_value() && x.dim() == 2;
+  auto x_ = x;
   if (unsqueeze) {
-    x_cast = x_cast.unsqueeze(-1);
+    x_ = x_.unsqueeze(-1);
   }
 
-  torch::Tensor out = torch::empty_like(x_cast);
+  torch::Tensor out = torch::empty_like(x_);
   auto& queue = vllm::xpu::vllmGetQueue();
 
   if (validate_data) {
@@ -534,14 +519,14 @@ torch::Tensor causal_conv1d_update(
   launch_update<scalar_t_, W_>(                                               \
       queue,                                                                   \
       out,                                                                     \
-      x_cast,                                                                  \
+      x_,                                                                      \
       conv_state,                                                              \
       weight,                                                                  \
       bias,                                                                    \
       activation,                                                              \
-      conv_state_indices_i32,                                                  \
-      num_accepted_tokens_i32,                                                 \
-      query_start_loc_i32,                                                     \
+      conv_state_indices,                                                      \
+      num_accepted_tokens,                                                     \
+      query_start_loc,                                                         \
       max_query_len,                                                           \
       pad_slot_id)
 
@@ -563,9 +548,9 @@ torch::Tensor causal_conv1d_update(
       TORCH_CHECK(false, "causal_conv1d_update only supports width in {2,3,4,5}, got ", width); \
   }
 
-  if (x_cast.scalar_type() == at::kBFloat16) {
+  if (x_.scalar_type() == at::kBFloat16) {
     DISPATCH_UPDATE_WIDTH(sycl::ext::oneapi::bfloat16)
-  } else if (x_cast.scalar_type() == at::kHalf) {
+  } else if (x_.scalar_type() == at::kHalf) {
     DISPATCH_UPDATE_WIDTH(sycl::half)
   } else {
     DISPATCH_UPDATE_WIDTH(float)
@@ -576,7 +561,7 @@ torch::Tensor causal_conv1d_update(
   if (unsqueeze) {
     out = out.squeeze(-1);
   }
-  return out.to(original_dtype);
+  return out;
 }
 
 }  // namespace vllm::xpu::causal_conv1d

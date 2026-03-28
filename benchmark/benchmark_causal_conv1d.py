@@ -75,7 +75,7 @@ def benchmark_forward(args):
     )
     query_start_loc = torch.cat(
         [torch.zeros(1, dtype=torch.int32), torch.cumsum(seqlens, dim=0)]
-    ).to(device)
+    ).to(device).to(torch.int32)
     total_tokens = int(query_start_loc[-1].item())
 
     dim = args.dim
@@ -143,7 +143,7 @@ def benchmark_update(args):
         )
         query_start_loc = torch.cat(
             [torch.zeros(1, dtype=torch.int32), torch.cumsum(seqlens, dim=0)]
-        ).to(device)
+        ).to(device).to(torch.int32)
         total_tokens = int(query_start_loc[-1].item())
         x = make_varlen_input(total_tokens, dim, args.dtype, device, args.layout)
         max_query_len = int(seqlens.max().item())

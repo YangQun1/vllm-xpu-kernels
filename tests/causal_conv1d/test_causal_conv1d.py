@@ -187,7 +187,7 @@ def test_causal_conv1d_fwd(dtype, activation, layout):
     seqlens = torch.randint(low=1, high=20, size=(batch,), dtype=torch.int32)
     query_start_loc = torch.cat(
         [torch.zeros(1, dtype=torch.int32), torch.cumsum(seqlens, dim=0)]
-    ).to(device)
+    ).to(device).to(torch.int32)
     total = int(query_start_loc[-1].item())
 
     x = _make_fwd_input(dim, total, dtype, device, layout)
@@ -282,7 +282,7 @@ def test_causal_conv1d_update(dtype, activation, layout):
     seqlens = torch.randint(low=1, high=8, size=(batch,), dtype=torch.int32)
     query_start_loc = torch.cat(
         [torch.zeros(1, dtype=torch.int32), torch.cumsum(seqlens, dim=0)]
-    ).to(device)
+    ).to(device).to(torch.int32)
     total = int(query_start_loc[-1].item())
 
     x_varlen = _make_varlen_input(total, dim, dtype, device, layout)
