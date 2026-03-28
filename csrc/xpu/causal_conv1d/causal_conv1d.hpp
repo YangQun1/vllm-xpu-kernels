@@ -313,7 +313,8 @@ struct causal_conv1d_channellast_fwd_kernel {
   }
 
   static inline void act_swish(float& x, float beta = 1.0f) {
-    x = x / (1.0f + sycl::exp(-x * beta));
+    constexpr float log2e = 1.44269504089f; // log2(e)
+    x = x / (1.0f + sycl::exp2(-x * beta * log2e));
   }
 
   static inline void act_silu(float& x) { act_swish(x, 1.0f); }
