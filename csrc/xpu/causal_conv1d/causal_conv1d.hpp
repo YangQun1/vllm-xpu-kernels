@@ -84,9 +84,11 @@ struct causal_conv1d_fwd_kernel {
     return sycl::nd_range<2>(global * local, local);
   }
 
-  static inline float silu(float x) {
-    return x / (1.0f + sycl::exp(-x));
+  static inline void act_swish(float& x, float beta = 1.0f) {
+    x = x / (1.0f + sycl::exp(-x * beta));
   }
+
+  static inline void act_silu(float& x) { act_swish(x, 1.0f); }
 
   [[sycl::reqd_sub_group_size(sub_group_size)]] void
   operator()(sycl::nd_item<2> item) const {
@@ -174,8 +176,10 @@ struct causal_conv1d_fwd_kernel {
         acc += xv * w_reg[k];
       }
 
-      if (act_mode == ActMode::silu || act_mode == ActMode::swish) {
-        acc = silu(acc);
+      if (act_mode == ActMode::silu) {
+        act_silu(acc);
+      } else if (act_mode == ActMode::swish) {
+        act_swish(acc);
       }
       o_seq_base[(token_offset + t) * stride_o_token] = static_cast<T>(acc);
     }
@@ -303,9 +307,11 @@ struct causal_conv1d_channellast_fwd_kernel {
     return sycl::nd_range<2>(global * local, local);
   }
 
-  static inline float silu(float x) {
-    return x / (1.0f + sycl::exp(-x));
+  static inline void act_swish(float& x, float beta = 1.0f) {
+    x = x / (1.0f + sycl::exp(-x * beta));
   }
+
+  static inline void act_silu(float& x) { act_swish(x, 1.0f); }
 
   [[sycl::reqd_sub_group_size(sub_group_size)]] void
   operator()(sycl::nd_item<2> item) const {
@@ -392,21 +398,21 @@ struct causal_conv1d_channellast_fwd_kernel {
           (has_bias && bias != nullptr) ? static_cast<float>(bias[feat]) : 0.0f;
 
       // Load weights of current channel to register
-      float w_reg[WIDTH];
+      T w_reg[WIDTH];
       int k = 0;
       const T* w_base = weight + feat * stride_w_dim;
       if constexpr (WIDTH >= 4) {
         vec_t w_vec;
         w_vec.load(0, w_base);
-        w_reg[0] = static_cast<float>(w_vec[0]);
-        w_reg[1] = static_cast<float>(w_vec[1]);
-        w_reg[2] = static_cast<float>(w_vec[2]);
-        w_reg[3] = static_cast<float>(w_vec[3]);
+        w_reg[0] = w_vec[0];
+        w_reg[1] = w_vec[1];
+        w_reg[2] = w_vec[2];
+        w_reg[3] = w_vec[3];
         k = 4;
       }
 #pragma unroll
       for (; k < WIDTH; ++k) {
-        w_reg[k] = static_cast<float>(w_base[k * stride_w_width]);
+        w_reg[k] = w_base[k * stride_w_width];
       }
 
       // Do convolution and activation, and store results to shared memory first
@@ -414,13 +420,14 @@ struct causal_conv1d_channellast_fwd_kernel {
         float acc = bias_val;
 #pragma unroll
         for (int k = 0; k < WIDTH; ++k) {
-          const float xv =
-              static_cast<float>(smem_ptr[(t + k) * BLOCK_N + local_id]);
-          acc += xv * w_reg[k];
+          const T xv = smem_ptr[(t + k) * BLOCK_N + local_id];
+          acc += static_cast<float>(xv * w_reg[k]);
         }
 
-        if (act_mode == ActMode::silu || act_mode == ActMode::swish) {
-          acc = silu(acc);
+        if (act_mode == ActMode::silu) {
+          act_silu(acc);
+        } else if (act_mode == ActMode::swish) {
+          act_swish(acc);
         }
         smem_ptr[t * BLOCK_N + local_id] = static_cast<T>(acc);
       }
@@ -578,9 +585,11 @@ struct causal_conv1d_update_kernel {
     return sycl::nd_range<2>(global * local, local);
   }
 
-  static inline float silu(float x) {
-    return x / (1.0f + sycl::exp(-x));
+  static inline void act_swish(float& x, float beta = 1.0f) {
+    x = x / (1.0f + sycl::exp(-x * beta));
   }
+
+  static inline void act_silu(float& x) { act_swish(x, 1.0f); }
 
   [[sycl::reqd_sub_group_size(sub_group_size)]] void
   operator()(sycl::nd_item<2> item) const {
@@ -661,8 +670,10 @@ struct causal_conv1d_update_kernel {
         const float xv = load_prev(src_token);
         acc += xv * w_reg[k];
       }
-      if (act_mode == ActMode::silu || act_mode == ActMode::swish) {
-        acc = silu(acc);
+      if (act_mode == ActMode::silu) {
+        act_silu(acc);
+      } else if (act_mode == ActMode::swish) {
+        act_swish(acc);
       }
       o_base[t * stride_o_token] = static_cast<T>(acc);
     }
