@@ -938,10 +938,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  (void)A_log;
-  (void)dt_bias;
-  (void)A;
-
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int local_id = item.get_local_linear_id();
   int current_batch_id = item.get_group(0);
@@ -1016,13 +1012,13 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       }
 
       float g_last_value =
-          a[(virtual_seq_offset + current_chunk_size - 1) +
+          a[(chunk_offset + current_chunk_size - 1) +
             v_head_id * total_virtual_seqlen];
       float g_last_value_exp = sycl::exp(g_last_value);
       CUTE_UNROLL
       for (int e = local_id; e < current_chunk_size; e += local_range) {
         float g_cumsum_value =
-            a[(virtual_seq_offset + e) + v_head_id * total_virtual_seqlen];
+            a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
         g_slm_ptr[e] = g_cumsum_value;
         g_multi_slm_ptr[e] = sycl::exp(g_last_value - g_cumsum_value);
         g_exp_slm_ptr[e] = sycl::exp(g_cumsum_value);
@@ -1044,14 +1040,14 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       item.barrier(sycl::access::fence_space::local_space);
 
       auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim +
-                   virtual_seq_offset * head_k_dim;
+                   chunk_offset * head_k_dim;
       auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
       auto W_tensor = make_tensor(
           make_gmem_ptr(W_ptr),
           make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
 
       auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim +
-                   virtual_seq_offset * head_v_dim;
+                   chunk_offset * head_v_dim;
       auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
       auto U_tensor = make_tensor(
           make_gmem_ptr(U_ptr),
@@ -1074,10 +1070,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto thr_mma = mma.get_slice(local_id);
 
       if (has_prev_state) {
-        // U shape: [chunk_size, head_v_dim]
-        // W shape: [chunk_size, head_k_dim]
-        // S shape: [head_v_dim, head_k_dim]
-        // [chunk_size, head_k_dim] * [head_v_dim, head_k_dim]^T = [chunk_size, head_v_dim]
         for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
           Tensor gU_C =
               local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -1149,14 +1141,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto tOrO2 = thr_o2_slm_store.retile_S(tCrO2_c);
       auto tOsO2 = thr_o2_slm_store.partition_D(O2_tensor_store);
 
-      // Q shape: [current_chunk_size, head_k_dim]
-      // K shape: [chunk_size, head_k_dim]
-      // [current_chunk_size, head_k_dim] * [chunk_size, head_k_dim]^T = [current_chunk_size, chunk_size]
       clear(tSrO2_c);
       gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
 
-      // Apply gated causal mask on O2:
-      //   O2[m, n] *= exp(g_m - g_n), and O2[m, n] = 0 for m < n.
       CUTE_UNROLL
       for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
         int n_idx =
@@ -1178,7 +1165,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto U_tensor_T = make_tensor(
           make_gmem_ptr(U_ptr),
           make_layout(U_tensor_T_shape, make_stride(_1{}, head_v_dim)));
-      auto O_ptr = core_attn_out + out_seq_offset * num_v_heads * head_v_dim +
+      auto O_ptr = core_attn_out + out_chunk_offset * num_v_heads * head_v_dim +
                    v_head_id * head_v_dim;
       auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
       auto O_tensor = make_tensor(
@@ -1191,12 +1178,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto thr_copy_O_c = copy_O_c.get_slice(local_id);
 
       if (has_prev_state) {
-        // Q shape: [current_chunk_size, head_k_dim]
-        // S shape: [head_v_dim, head_k_dim]
-        // O2 shape: [current_chunk_size, chunk_size]
-        // UT shape: [head_v_dim, chunk_size]
-        // Q*S: [current_chunk_size, head_k_dim] * [head_v_dim, head_k_dim]^T = [current_chunk_size, head_v_dim]
-        // O2*UT: [current_chunk_size, chunk_size] * [head_v_dim, chunk_size]^T = [current_chunk_size, head_v_dim]
         for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
           Tensor gO_C =
               local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
@@ -1222,10 +1203,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
         }
       }
 
-      // ------------------------------------------------------------------
-      // Part 2: Advance recurrent state S for the next chunk.
-      // ------------------------------------------------------------------
-      //   S_next = exp(g_last) * S_prev + sum_t exp(g_last - g_t) * U_t^T K_t
       auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
       auto K_tensor_T = make_tensor(
           make_gmem_ptr(k_ptr),
