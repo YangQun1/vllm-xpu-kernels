@@ -1174,9 +1174,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       reorder(tSrO2_c, tCrO2_c);
       copy(o2_slm_store, tOrO2, tOsO2);
 
-      // barrier to make sure O2 is visible to afterward O compute
-      item.barrier(sycl::access::fence_space::local_space);
-
       auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
       auto U_tensor_T = make_tensor(
           make_gmem_ptr(U_ptr),
@@ -1219,19 +1216,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               tSrO_c(sn * SG_M + sm) *= g_exp_slm_ptr[(m_idx)];
             }
           }
-          gemm_SmemTTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
-          reorder(tSrO_c, tCrO_c);
-          copy(copy_O_c, tCrO_c, tCgO_c);
-        }
-      } else {
-        for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-          Tensor gO_C =
-              local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
-          auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
-          auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
-          auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
-
-          clear(tSrO_c);
           gemm_SmemTTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
@@ -1282,6 +1266,21 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
           reorder(tSrS_d, tCrS_d);
           copy(copy_S_d, tCrS_d, tCgS_d);
+        }
+      }
+
+      if (!has_prev_state) {
+        for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
+          Tensor gO_C =
+              local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
+          auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
+          auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
+
+          clear(tSrO_c);
+          gemm_SmemTTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          reorder(tSrO_c, tCrO_c);
+          copy(copy_O_c, tCrO_c, tCgO_c);
         }
       }
     }
