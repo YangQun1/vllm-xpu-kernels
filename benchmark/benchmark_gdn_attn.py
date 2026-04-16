@@ -78,7 +78,7 @@ def main(
                              dtype=dtype)
     ssm_state = torch.randn(
         (cache_batch_size, num_v_heads // tp_size, head_v_dim, head_k_dim),
-        dtype=dtype,
+        dtype=torch.float32,
     )
 
     conv_weights = torch.randn((mixed_qkv_size, width), dtype=dtype)
@@ -175,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype",
                         type=str,
                         choices=["half", "bfloat16"],
-                        default="half")
+                        default="bfloat16")
     parser.add_argument("--cache-batch-size", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-warmup-iters", type=int, default=10)
