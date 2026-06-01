@@ -60,6 +60,31 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "-> (Tensor, Tensor)");
   xpu_ops.impl("deepseek_scaling_rope", torch::kXPU, &deepseek_scaling_rope);
 
+  xpu_ops.def(
+      "mhc_pre(Tensor residual, Tensor fn, Tensor hc_scale, Tensor hc_base, "
+      "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
+      "float hc_post_mult_value, int sinkhorn_repeat) "
+      "-> (Tensor, Tensor, Tensor)");
+  xpu_ops.impl("mhc_pre", torch::kXPU, &mhc_pre);
+
+  xpu_ops.def(
+      "mhc_post(Tensor x, Tensor residual, Tensor post_layer_mix, "
+      "Tensor comb_res_mix) -> Tensor");
+  xpu_ops.impl("mhc_post", torch::kXPU, &mhc_post);
+
+  xpu_ops.def(
+      "hc_head_fused(Tensor hs_flat, Tensor fn, Tensor hc_scale, "
+      "Tensor hc_base, Tensor(a!) out, float rms_eps, float hc_eps) -> ()");
+  xpu_ops.impl("hc_head_fused", torch::kXPU, &hc_head_fused);
+
+  xpu_ops.def(
+      "mhc_fused_post_pre(Tensor x, Tensor residual, Tensor post_layer_mix, "
+      "Tensor comb_res_mix, Tensor fn, Tensor hc_scale, Tensor hc_base, "
+      "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
+      "float hc_post_mult_value, int sinkhorn_repeat) "
+      "-> (Tensor, Tensor, Tensor, Tensor)");
+  xpu_ops.impl("mhc_fused_post_pre", torch::kXPU, &mhc_fused_post_pre);
+
   // Multi-modal Rotary Embedding (M-RoPE) — used by e.g. Qwen2-VL.
   // positions has shape [num_mrope_sections, num_tokens]; mrope_section is
   // an int32 device tensor of length num_mrope_sections that partitions the

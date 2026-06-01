@@ -76,6 +76,47 @@ std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     int64_t rotary_dim,
     bool is_neox);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mhc_pre(
+    const at::Tensor& residual,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    int64_t sinkhorn_repeat);
+
+at::Tensor mhc_post(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix);
+
+void hc_head_fused(
+    const at::Tensor& hs_flat,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    at::Tensor& out,
+    double rms_eps,
+    double hc_eps);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    int64_t sinkhorn_repeat);
+
 void multimodal_rotary_embedding(
     torch::Tensor& positions,  // [num_mrope_sections, num_tokens]
     torch::Tensor& query,

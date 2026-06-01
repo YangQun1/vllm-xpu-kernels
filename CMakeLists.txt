@@ -440,6 +440,9 @@ set(VLLM_XPU_INCLUDE_DIR "")
 list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/)
 list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/sycl/)
 list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/syclcompat/)
+if(BUILD_SYCL_TLA_KERNELS)
+  list(APPEND VLLM_XPU_INCLUDE_DIR ${SYCL_TLA_INCLUDE_DIRS})
+endif()
 message(STATUS "VLLM_XPU_INCLUDE_DIR: ${VLLM_XPU_INCLUDE_DIR}")
 
 set(VLLM_XPU_LINK_LIBRARIES "")
@@ -587,10 +590,19 @@ endif()
 if(XPU_SPECIFIC_KERNELS_ENABLED)
   message(STATUS "Enabling _xpu_C extension.")
 
+  set(VLLM_EXT_XPU_COMPILE_FLAGS ${VLLM_GPU_COMPILE_FLAGS})
+  if(BUILD_SYCL_TLA_KERNELS)
+    list(APPEND VLLM_EXT_XPU_COMPILE_FLAGS ${VLLM_CUTLASS_FLAGS})
+  endif()
+
   set(VLLM_EXT_XPU_SRC
       "csrc/xpu/torch_bindings.cpp"
       "csrc/xpu/lora/lora_shrink.cpp"
       "csrc/xpu/lora/lora_expand.cpp"
+      "csrc/xpu/mhc/mhc_pre.cpp"
+      "csrc/xpu/mhc/mhc_post.cpp"
+      "csrc/xpu/mhc/hc_head_fused.cpp"
+      "csrc/xpu/mhc/mhc_fused_post_pre.cpp"
       "csrc/xpu/sampler/topk_topp_sampler.cpp"
       "csrc/xpu/sycl/deepseek_scaling_rope.cpp"
       "csrc/xpu/sycl/multimodal_rope.cpp"
@@ -630,7 +642,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     SOURCES
     ${VLLM_EXT_XPU_SRC}
     COMPILE_FLAGS
-    ${VLLM_GPU_COMPILE_FLAGS}
+    ${VLLM_EXT_XPU_COMPILE_FLAGS}
     LINK_FLAGS
     ${VLLM_GPU_LINK_FLAGS}
     ARCHITECTURES
