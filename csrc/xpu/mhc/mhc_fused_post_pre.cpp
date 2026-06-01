@@ -1,7 +1,8 @@
 // DeepSeek V4 MHC fused post+pre kernel.
 //
 // Phase 0: composed — calls launch_mhc_post_opt, then
-//   launch_mhc_pre_stage1_{vector,matrix} + launch_mhc_pre_stage2.
+//   Small M: launch_mhc_pre_stage1_vector + launch_mhc_pre_stage2
+//   Large M: launch_mhc_pre_splitk_gemm + launch_mhc_pre_fused_reduce_stage2
 //   Future phases will fuse the small-N path into a single kernel.
 //
 // Data flow:
@@ -29,7 +30,7 @@
 using bf16 = sycl::ext::oneapi::bfloat16;
 
 static constexpr int HC = 4;
-static constexpr int DISPATCH_THRESHOLD = 2048;
+static constexpr int DISPATCH_THRESHOLD = 128;
 
 // ---- extern declarations for launch functions (defined in sibling TUs) ----
 
@@ -54,15 +55,32 @@ extern sycl::event launch_mhc_pre_stage1_vector(
     int H,
     float rms_eps);
 
-extern void launch_mhc_pre_stage1_matrix(
+extern std::tuple<int, int, int, int> mhc_pre_splitk_params(int M, int H);
+
+extern void launch_mhc_pre_splitk_gemm(
     sycl::queue& queue,
     const bf16* residual,
     const float* fn,
-    float* rms_mixes,
-    int M,
-    int K,
-    int N_gemm,
-    float rms_eps);
+    float* ws_c,
+    float* ws_sqr,
+    int M, int H,
+    int n_splits, int M_padded);
+
+extern sycl::event launch_mhc_pre_fused_reduce_stage2(
+    sycl::queue& q,
+    const float* ws_c,
+    const float* ws_sqr,
+    const bf16*  residual,
+    const float* hc_scale,
+    const float* hc_base,
+    float*       post_mix,
+    float*       comb_mix,
+    bf16*        layer_input,
+    int num_tokens, int hidden_size,
+    int n_splits, int M_padded, int K,
+    float rms_eps,
+    float hc_pre_eps, float hc_sinkhorn_eps,
+    float hc_post_mult_value, int sinkhorn_repeat);
 
 extern sycl::event launch_mhc_pre_stage2(
     sycl::queue& q,
@@ -150,10 +168,11 @@ mhc_fused_post_pre(
         M,
         static_cast<int>(H));
 
-    // ---- mhc_pre stage 1: GEMM + RMS-norm → rms_mixes ----
-    auto rms_mixes = at::empty({M, N_gemm}, opts_f32);
-
+    // ---- mhc_pre: GEMM + RMS-norm + sigmoid / Sinkhorn / weighted reduction ----
     if (N < DISPATCH_THRESHOLD) {
+        // --- Small M: vector dot-product path → standalone Stage 2 ---
+        auto rms_mixes = at::empty({M, N_gemm}, opts_f32);
+
         launch_mhc_pre_stage1_vector(
             queue,
             reinterpret_cast<const bf16*>(residual_cur.data_ptr()),
@@ -162,34 +181,55 @@ mhc_fused_post_pre(
             M,
             static_cast<int>(H),
             static_cast<float>(rms_eps));
+
+        launch_mhc_pre_stage2(
+            queue,
+            rms_mixes.data_ptr<float>(),
+            reinterpret_cast<const bf16*>(residual_cur.data_ptr()),
+            hc_scale.data_ptr<float>(),
+            hc_base.data_ptr<float>(),
+            post_mix_cur.data_ptr<float>(),
+            comb_mix_cur.data_ptr<float>(),
+            reinterpret_cast<bf16*>(layer_input_cur.data_ptr()),
+            M,
+            static_cast<int>(H),
+            static_cast<float>(hc_pre_eps),
+            static_cast<float>(hc_sinkhorn_eps),
+            static_cast<float>(hc_post_mult_value),
+            static_cast<int>(sinkhorn_repeat));
     } else {
-        launch_mhc_pre_stage1_matrix(
+        // --- Large M: Split-K DPAS GEMM → Fused Reduce+Stage2 ---
+        auto [n_splits, M_padded, K_val, N_g] = mhc_pre_splitk_params(M, static_cast<int>(H));
+        auto workspace_c   = at::empty({n_splits * M_padded, N_g}, opts_f32);
+        auto workspace_sqr = at::empty({n_splits * M_padded}, opts_f32);
+
+        launch_mhc_pre_splitk_gemm(
             queue,
             reinterpret_cast<const bf16*>(residual_cur.data_ptr()),
             fn_c.data_ptr<float>(),
-            rms_mixes.data_ptr<float>(),
-            M,
-            K,
-            N_gemm,
-            static_cast<float>(rms_eps));
-    }
+            workspace_c.data_ptr<float>(),
+            workspace_sqr.data_ptr<float>(),
+            M, static_cast<int>(H),
+            n_splits, M_padded);
 
-    // ---- mhc_pre stage 2: sigmoid / Sinkhorn / weighted reduction ----
-    launch_mhc_pre_stage2(
-        queue,
-        rms_mixes.data_ptr<float>(),
-        reinterpret_cast<const bf16*>(residual_cur.data_ptr()),
-        hc_scale.data_ptr<float>(),
-        hc_base.data_ptr<float>(),
-        post_mix_cur.data_ptr<float>(),
-        comb_mix_cur.data_ptr<float>(),
-        reinterpret_cast<bf16*>(layer_input_cur.data_ptr()),
-        M,
-        static_cast<int>(H),
-        static_cast<float>(hc_pre_eps),
-        static_cast<float>(hc_sinkhorn_eps),
-        static_cast<float>(hc_post_mult_value),
-        static_cast<int>(sinkhorn_repeat));
+        launch_mhc_pre_fused_reduce_stage2(
+            queue,
+            workspace_c.data_ptr<float>(),
+            workspace_sqr.data_ptr<float>(),
+            reinterpret_cast<const bf16*>(residual_cur.data_ptr()),
+            hc_scale.data_ptr<float>(),
+            hc_base.data_ptr<float>(),
+            post_mix_cur.data_ptr<float>(),
+            comb_mix_cur.data_ptr<float>(),
+            reinterpret_cast<bf16*>(layer_input_cur.data_ptr()),
+            M, static_cast<int>(H),
+            n_splits, M_padded, K_val,
+            static_cast<float>(rms_eps),
+            static_cast<float>(hc_pre_eps),
+            static_cast<float>(hc_sinkhorn_eps),
+            static_cast<float>(hc_post_mult_value),
+            static_cast<int>(sinkhorn_repeat));
+    }
 
     return {residual_cur,
             post_mix_cur.view({N, HC, 1}),
