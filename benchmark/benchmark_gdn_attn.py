@@ -490,7 +490,7 @@ if __name__ == "__main__":
     args = parse_args()
     seed = 1234
     seed_everything(seed)
-    iterations = 30
+    iterations = 200
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
 
