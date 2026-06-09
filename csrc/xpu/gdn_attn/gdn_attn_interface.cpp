@@ -11,6 +11,14 @@
   #include "xe_2/chunk_causal_conv1d_tiled_xe2.hpp"
   #include "xe_2/l2norm.h"
   #include "xe_2/chunk_gated_delta_rule_xe2.h"
+  #include "xe_2/chunk_gated_delta_rule_v2_xe2.h"
+#endif
+
+#ifdef VLLM_XPU_ENABLE_XE2
+static bool use_v2_kernel() {
+  static bool v2 = std::getenv("VLLM_GDN_USE_V1_KERNEL") == nullptr;
+  return v2;
+}
 #endif
 
 void gdn_attention(
@@ -499,23 +507,43 @@ void gdn_attention(
         l2norm(queue, q, k);
       }
 
-      chunk_gated_delta_rule_xe2(
-          queue,
-          core_attn_out_active,
-          q,
-          k,
-          v,
-          b,
-          a,
-          A_log,
-          dt_bias,
-          ssm_state,
-          *non_spec_query_start_loc,
-          *non_spec_state_indices_tensor,
-          has_initial_state,
-          num_prefills,
-          num_decodes,
-          token_indx_ptr);
+      if (use_v2_kernel()) {
+        chunk_gated_delta_rule_v2_xe2(
+            queue,
+            core_attn_out_active,
+            q,
+            k,
+            v,
+            b,
+            a,
+            A_log,
+            dt_bias,
+            ssm_state,
+            *non_spec_query_start_loc,
+            *non_spec_state_indices_tensor,
+            has_initial_state,
+            num_prefills,
+            num_decodes,
+            token_indx_ptr);
+      } else {
+        chunk_gated_delta_rule_xe2(
+            queue,
+            core_attn_out_active,
+            q,
+            k,
+            v,
+            b,
+            a,
+            A_log,
+            dt_bias,
+            ssm_state,
+            *non_spec_query_start_loc,
+            *non_spec_state_indices_tensor,
+            has_initial_state,
+            num_prefills,
+            num_decodes,
+            token_indx_ptr);
+      }
     } else {
       NATIVE_LAUNCHER;
     }
