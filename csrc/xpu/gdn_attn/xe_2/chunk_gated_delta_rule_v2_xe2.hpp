@@ -1258,11 +1258,10 @@ struct chunk_gated_delta_rule_v2_kernel {
         make_gmem_ptr(k_ptr_chunk),
         make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
-    // L workspace (InverseType) and T output (Element) for this chunk.
+    // L workspace (InverseType) for this chunk. The inverse (T = L^{-1}·diag(β))
+    // is produced by a separate single-subgroup inverse kernel (run_inverse),
+    // which reads this l_buf and writes t_buf.
     auto L_ptr = l_buf +
-           static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
-           chunk_offset * chunk_size;
-    auto T_ptr = t_buf +
            static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
            chunk_offset * chunk_size;
 
@@ -1323,10 +1322,6 @@ struct chunk_gated_delta_rule_v2_kernel {
     }
 
     item.barrier(sycl::access::fence_space::global_and_local);
-
-    // Stage 3: inverse T = L^{-1}·diag(β). compute_inverse ends with its own
-    // work-group barrier, so the SLM is safe to reuse on the next chunk.
-    compute_inverse(T_ptr, L_ptr, beta_chunk_ptr, item);
   }
 
   // ============================================================================
@@ -1366,6 +1361,310 @@ struct chunk_gated_delta_rule_v2_kernel {
         compute_front_body(
             chunk_offset, current_chunk_size, v_head_id, kv_head_id,
             slm_ptr, item);
+        chunk_id += global_chunk_range;
+      }
+      pre_chunks = cumsum_chunks;
+    }
+  }
+
+  // ============================================================================
+  // Inverse body (single sub-group, barrier-free): migrated from V1's
+  // chunk_inverse_opt_kernel. Inverts L in place (l_buf) into L^{-1}, then fuses
+  // beta and casts to Element into t_buf. Runs with 16 threads (1 sub-group) per
+  // work-group so it is embarrassingly parallel across chunks — NO work-group
+  // barriers (intra-block dependencies handled by sub-group broadcast + program
+  // order / scoreboard), unlike the 128-thread DPAS path.
+  // ============================================================================
+  CUTE_DEVICE void compute_inverse_opt_body(
+      InverseType* L_ptr,
+      T* T_out_ptr,
+      const float* beta_chunk_ptr,
+      sycl::nd_item<3>& item) const {
+    int local_id = item.get_local_linear_id();
+    int local_range = item.get_local_range(2);
+    auto sg = item.get_sub_group();
+    int sg_local_id = sg.get_local_linear_id();
+
+    MmaInverse mma{};
+    auto wg_tile = mma.tile_mnk();
+    auto thr_mma = mma.get_slice(local_id);
+
+    auto A_ptr = L_ptr;
+
+    // ----- Step 1: invert the 4 diagonal 16×16 blocks (forward substitution) --
+    CUTE_UNROLL
+    for (int i = 0; i < 4; ++i) {
+      int offset = i * 16;
+      InverseType* A_ptr_xx = A_ptr + offset * chunk_size + offset;
+      float A_local[16];
+      float A_other[16];
+      float A_sum;
+      CUTE_UNROLL
+      for (int e = 0; e < sg_local_id + 1; ++e) {
+        A_local[e] = 0.0f;
+      }
+
+      InverseType A_load[16];
+      CUTE_UNROLL
+      for (int e = 0; e < sg_local_id; ++e) {
+        A_load[e] = A_ptr_xx[sg_local_id * chunk_size + e];
+      }
+
+      CUTE_UNROLL
+      for (int mm_idx = 1; mm_idx < 16; ++mm_idx) {
+        CUTE_UNROLL
+        for (int nn_idx = 0; nn_idx < mm_idx; ++nn_idx) {
+          float send_value = static_cast<float>(A_load[nn_idx]);
+          float receive_value = sycl::group_broadcast(sg, send_value, mm_idx);
+          if (sg_local_id == nn_idx) {
+            A_local[mm_idx] = receive_value;
+          }
+        }
+      }
+
+      CUTE_UNROLL
+      for (int mm_idx = 1; mm_idx < 16; ++mm_idx) {
+        A_sum = 0.0f;
+        CUTE_UNROLL
+        for (int e = 1; e < mm_idx + 1; ++e) {
+          A_other[e] = sycl::group_broadcast(sg, A_local[mm_idx], e);
+        }
+
+        CUTE_UNROLL
+        for (int e = 1; e < mm_idx + 1; ++e) {
+          A_sum += A_local[e] * A_other[e];
+        }
+
+        A_local[mm_idx] = -A_local[mm_idx] - A_sum;
+      }
+
+      CUTE_UNROLL
+      for (int e = sg_local_id + 1; e < 16; ++e) {
+        A_ptr_xx[e * chunk_size + sg_local_id] =
+            static_cast<InverseType>(A_local[e]);
+      }
+    }
+
+    // ----- Step 2: 6 off-diagonal 16×16 block GEMMs (back substitution) -------
+    auto A_ptr_11 = A_ptr;
+    auto A_ptr_21 = A_ptr + 16 * chunk_size;
+    auto A_ptr_22 = A_ptr + 16 * chunk_size + 16;
+    auto A_ptr_31 = A_ptr + 32 * chunk_size;
+    auto A_ptr_32 = A_ptr + 32 * chunk_size + 16;
+    auto A_ptr_33 = A_ptr + 32 * chunk_size + 32;
+    auto A_ptr_41 = A_ptr + 48 * chunk_size;
+    auto A_ptr_42 = A_ptr + 48 * chunk_size + 16;
+    auto A_ptr_43 = A_ptr + 48 * chunk_size + 32;
+    auto A_ptr_44 = A_ptr + 48 * chunk_size + 48;
+
+    auto A_XX_tensor_shape = make_shape(16, 16);
+
+    auto A_11_tensor_T = make_tensor(make_gmem_ptr(A_ptr_11),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+
+    auto A_21_tensor = make_tensor(make_gmem_ptr(A_ptr_21),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_21_tensor_T = make_tensor(make_gmem_ptr(A_ptr_21),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+    auto A_22_tensor = make_tensor(make_gmem_ptr(A_ptr_22),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_22_tensor_T = make_tensor(make_gmem_ptr(A_ptr_22),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+
+    auto A_31_tensor = make_tensor(make_gmem_ptr(A_ptr_31),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_31_tensor_T = make_tensor(make_gmem_ptr(A_ptr_31),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+    auto A_32_tensor = make_tensor(make_gmem_ptr(A_ptr_32),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_32_tensor_T = make_tensor(make_gmem_ptr(A_ptr_32),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+    auto A_33_tensor = make_tensor(make_gmem_ptr(A_ptr_33),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_33_tensor_T = make_tensor(make_gmem_ptr(A_ptr_33),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+
+    auto A_41_tensor = make_tensor(make_gmem_ptr(A_ptr_41),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_41_tensor_T = make_tensor(make_gmem_ptr(A_ptr_41),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+    auto A_42_tensor = make_tensor(make_gmem_ptr(A_ptr_42),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_42_tensor_T = make_tensor(make_gmem_ptr(A_ptr_42),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+    auto A_43_tensor = make_tensor(make_gmem_ptr(A_ptr_43),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    auto A_43_tensor_T = make_tensor(make_gmem_ptr(A_ptr_43),
+        make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
+    auto A_44_tensor = make_tensor(make_gmem_ptr(A_ptr_44),
+        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+
+    Tensor cA = make_identity_tensor(A_XX_tensor_shape);
+    Tensor cB = make_identity_tensor(A_XX_tensor_shape);
+    Tensor cC = make_identity_tensor(A_XX_tensor_shape);
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(0, _));
+    Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(0, _));
+    Tensor gC = local_tile(cC, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+    auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+    auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+    auto tCrC = thr_mma.partition_sg_fragment_C(gC);
+
+    // T_21 = -(T_22 × KK_21 × T_11)
+    auto copy_D_21 = get_block_2d_copy_D<void>(mma, A_21_tensor);
+    auto thr_copy_D_21 = copy_D_21.get_slice(local_id);
+    auto tCrD_21 = thr_copy_D_21.partition_sg_fragment_S(gC);
+    auto tCgD_21 = thr_copy_D_21.partition_D(gC);
+    clear(tCrC);
+    gemm_TTS(A_22_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    reorder(tCrC, tCrA);
+    clear(tCrC);
+    gemm_STS(tCrA, A_11_tensor_T, tCrC, 0, 0, mma);
+    CUTE_UNROLL
+    for (int i = 0; i < tCrC.size(); ++i) {
+      tCrC(i) *= -1.0f;
+    }
+    reorder(tCrC, tCrD_21);
+    copy(copy_D_21, tCrD_21, tCgD_21);
+
+    // T_31 = -T_33 × (KK_31×T_11 + KK_32×T_21)
+    auto copy_D_31 = get_block_2d_copy_D<void>(mma, A_31_tensor);
+    auto thr_copy_D_31 = copy_D_31.get_slice(local_id);
+    auto tCrD_31 = thr_copy_D_31.partition_sg_fragment_S(gC);
+    auto tCgD_31 = thr_copy_D_31.partition_D(gC);
+    clear(tCrC);
+    gemm_TTS(A_31_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS(A_32_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    reorder(tCrC, tCrD_31);
+    copy(copy_D_31, tCrD_31, tCgD_31);
+    clear(tCrC);
+    gemm_TTS(A_33_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
+    CUTE_UNROLL
+    for (int i = 0; i < tCrC.size(); ++i) {
+      tCrC(i) *= -1.0f;
+    }
+    reorder(tCrC, tCrD_31);
+    copy(copy_D_31, tCrD_31, tCgD_31);
+
+    // T_41 = -T_44 × (KK_41×T_11 + KK_42×T_21 + KK_43×T_31)
+    auto copy_D_41 = get_block_2d_copy_D<void>(mma, A_41_tensor);
+    auto thr_copy_D_41 = copy_D_41.get_slice(local_id);
+    auto tCrD_41 = thr_copy_D_41.partition_sg_fragment_S(gC);
+    auto tCgD_41 = thr_copy_D_41.partition_D(gC);
+    clear(tCrC);
+    gemm_TTS(A_41_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS(A_42_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS(A_43_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
+    reorder(tCrC, tCrD_41);
+    copy(copy_D_41, tCrD_41, tCgD_41);
+    clear(tCrC);
+    gemm_TTS(A_44_tensor, A_41_tensor_T, tCrC, 0, 0, mma);
+    CUTE_UNROLL
+    for (int i = 0; i < tCrC.size(); ++i) {
+      tCrC(i) *= -1.0f;
+    }
+    reorder(tCrC, tCrD_41);
+    copy(copy_D_41, tCrD_41, tCgD_41);
+
+    // T_32 = -(T_33 × KK_32 × T_22)
+    auto copy_D_32 = get_block_2d_copy_D<void>(mma, A_32_tensor);
+    auto thr_copy_D_32 = copy_D_32.get_slice(local_id);
+    auto tCrD_32 = thr_copy_D_32.partition_sg_fragment_S(gC);
+    auto tCgD_32 = thr_copy_D_32.partition_D(gC);
+    clear(tCrC);
+    gemm_TTS(A_33_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
+    reorder(tCrC, tCrA);
+    clear(tCrC);
+    gemm_STS(tCrA, A_22_tensor_T, tCrC, 0, 0, mma);
+    CUTE_UNROLL
+    for (int i = 0; i < tCrC.size(); ++i) {
+      tCrC(i) *= -1.0f;
+    }
+    reorder(tCrC, tCrD_32);
+    copy(copy_D_32, tCrD_32, tCgD_32);
+
+    // T_42 = -T_44 × (KK_42×T_22 + KK_43×T_32)
+    auto copy_D_42 = get_block_2d_copy_D<void>(mma, A_42_tensor);
+    auto thr_copy_D_42 = copy_D_42.get_slice(local_id);
+    auto tCrD_42 = thr_copy_D_42.partition_sg_fragment_S(gC);
+    auto tCgD_42 = thr_copy_D_42.partition_D(gC);
+    clear(tCrC);
+    gemm_TTS(A_42_tensor, A_22_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS(A_43_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
+    reorder(tCrC, tCrD_42);
+    copy(copy_D_42, tCrD_42, tCgD_42);
+    clear(tCrC);
+    gemm_TTS(A_44_tensor, A_42_tensor_T, tCrC, 0, 0, mma);
+    CUTE_UNROLL
+    for (int i = 0; i < tCrC.size(); ++i) {
+      tCrC(i) *= -1.0f;
+    }
+    reorder(tCrC, tCrD_42);
+    copy(copy_D_42, tCrD_42, tCgD_42);
+
+    // T_43 = -(T_44 × KK_43 × T_33)
+    auto copy_D_43 = get_block_2d_copy_D<void>(mma, A_43_tensor);
+    auto thr_copy_D_43 = copy_D_43.get_slice(local_id);
+    auto tCrD_43 = thr_copy_D_43.partition_sg_fragment_S(gC);
+    auto tCgD_43 = thr_copy_D_43.partition_D(gC);
+    clear(tCrC);
+    gemm_TTS(A_44_tensor, A_43_tensor_T, tCrC, 0, 0, mma);
+    reorder(tCrC, tCrA);
+    clear(tCrC);
+    gemm_STS(tCrA, A_33_tensor_T, tCrC, 0, 0, mma);
+    CUTE_UNROLL
+    for (int i = 0; i < tCrC.size(); ++i) {
+      tCrC(i) *= -1.0f;
+    }
+    reorder(tCrC, tCrD_43);
+    copy(copy_D_43, tCrD_43, tCgD_43);
+
+    // ----- Step 3: fuse beta and cast to Element -> t_buf ---------------------
+    // T_out[row,col] = cast<Element>(L^{-1}[row,col] × β[col]). Diagonal of
+    // L^{-1} is 1 and strict-upper is 0 (unchanged from the unit-lower L).
+    for (int col = local_id; col < chunk_size; col += local_range) {
+      float bv = beta_chunk_ptr[col];
+      CUTE_UNROLL
+      for (int row = 0; row < chunk_size; ++row) {
+        T_out_ptr[row * chunk_size + col] =
+            static_cast<T>(static_cast<float>(L_ptr[row * chunk_size + col]) * bv);
+      }
+    }
+  }
+
+  // ============================================================================
+  // Inverse kernel entry: chunk×head persistent grid, 1 sub-group per chunk.
+  // Reads l_buf (L from run_front), writes t_buf (T = L^{-1}·diag(β)).
+  // ============================================================================
+  void run_inverse(sycl::nd_item<3> item) const {
+    const int v_head_id = item.get_group(1) % num_v_heads;
+    int chunk_id = item.get_group(1) / num_v_heads;
+    const int global_chunk_range = item.get_group_range(1) / num_v_heads;
+
+    int pre_chunks = 0;
+    for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
+      const int seq_start_offset = query_start_loc[batch_id];
+      const int seq_end_offset = query_start_loc[batch_id + 1];
+      const int seq_len = seq_end_offset - seq_start_offset;
+      const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
+      const int cumsum_chunks = pre_chunks + current_chunks;
+
+      if (chunk_id >= cumsum_chunks) {
+        pre_chunks = cumsum_chunks;
+        continue;
+      }
+
+      while (chunk_id < cumsum_chunks) {
+        const int chunk_offset = chunk_id * chunk_size;
+        auto L_ptr = l_buf +
+            static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
+            chunk_offset * chunk_size;
+        auto T_ptr = t_buf +
+            static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
+            chunk_offset * chunk_size;
+        const float* beta_chunk_ptr =
+            beta + static_cast<int64_t>(v_head_id) * total_virtual_seqlen +
+            chunk_offset;
+        compute_inverse_opt_body(L_ptr, T_ptr, beta_chunk_ptr, item);
         chunk_id += global_chunk_range;
       }
       pre_chunks = cumsum_chunks;
@@ -1467,6 +1766,22 @@ struct chunk_gated_delta_rule_v2_kernel {
     return sycl::nd_range<3>{global * local, local};
   }
 
+  // Inverse kernel launch config: 1 sub-group (16 threads) per work-group so
+  // each work-group solves one chunk's inverse with NO work-group barriers
+  // (mirrors V1's ChunkInverseOptKernel). chunk×head persistent grid.
+  static sycl::nd_range<3> get_inverse_nd_range(int num_v_heads) {
+    MmaInverse mma_inv{};
+    int threads_per_wg = size(mma_inv);
+    int sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+    int num_wg =
+        (sm_count * MaxThreadsPerSM / threads_per_wg + num_v_heads - 1) /
+        num_v_heads * num_v_heads;
+    sycl::range<3> local(1, 1, threads_per_wg);
+    sycl::range<3> global(1, num_wg, 1);
+    return sycl::nd_range<3>{global * local, local};
+  }
+
   static int get_slm_size() {
     return slm_total_size;
   }
@@ -1480,6 +1795,9 @@ class ChunkGDNV2Kernel;
 
 template <typename T, typename StateT>
 class ChunkGDNV2FrontKernel;
+
+template <typename T, typename StateT>
+class ChunkGDNV2InverseKernel;
 
 // ============================================================================
 // Launcher function
@@ -1571,10 +1889,10 @@ void kernel_launcher_v2(
       head_v_dim};
 
   // -------------------------------------------------------------------------
-  // Step 1b: Launch chunk-parallel front kernel (L build + inverse -> t_buf).
-  // Runs after prepare (needs alpha_buf) and before the main kernel (which
-  // reads t_buf in Stage 5). Reuses the same Kernel struct/params; only the
-  // grid and the entry point (run_front) differ.
+  // Step 1b: Launch chunk-parallel front kernel (KK -> L build -> l_buf).
+  // Runs after prepare (needs alpha_buf); 128 threads (8 sub-groups) for the
+  // DPAS KK build. Reuses the same Kernel struct/params; only the grid and the
+  // entry point (run_front) differ.
   // -------------------------------------------------------------------------
   {
     auto front_range = Kernel::get_front_nd_range(num_v_heads);
@@ -1587,6 +1905,25 @@ void kernel_launcher_v2(
             float* slm_ptr = static_cast<float*>(
                 local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
             kernel_obj.run_front(item, slm_ptr);
+          });
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 1c: Launch chunk-parallel inverse kernel (l_buf -> T = L^{-1}·diag(β)
+  // -> t_buf). 1 sub-group (16 threads) per work-group, NO work-group barriers,
+  // so it is embarrassingly parallel across chunks (mirrors V1's
+  // ChunkInverseOptKernel). Runs after the front kernel (needs l_buf) and
+  // before the main kernel (reads t_buf in Stage 5). No SLM needed.
+  // -------------------------------------------------------------------------
+  {
+    auto inverse_range = Kernel::get_inverse_nd_range(num_v_heads);
+    queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for<ChunkGDNV2InverseKernel<T, StateT>>(
+          inverse_range,
+          kernel_props,
+          [=](sycl::nd_item<3> item) {
+            kernel_obj.run_inverse(item);
           });
     });
   }
