@@ -307,7 +307,7 @@ struct chunk_gated_delta_rule_v2_kernel {
     item.barrier(sycl::access::fence_space::local_space);
   }
 
-# if 0 // Not used in the current V2 path, keep for reference/debug only
+# if 1 // Not used in the current V2 path, keep for reference/debug only
   // ============================================================================
   // Inverse algorithm: 16×16 block forward substitution (design §2.5)
   // T_out = L^{-1} · diag(β), where L is a unit-lower matrix (I+strict_lower)
@@ -660,7 +660,7 @@ struct chunk_gated_delta_rule_v2_kernel {
   // ============================================================================
   CUTE_DEVICE void compute_inverse_slm(
       T* T_out_ptr,                 // output [chunk_size × chunk_size], Element
-      InverseType* L_ptr,           // in-place [chunk_size × chunk_size]: L -> T_pure
+      InverseType* L_ptr,           // input [chunk_size × chunk_size]: unit-lower L source
       const float* beta_chunk_ptr,
       float* slm_ptr,
       sycl::nd_item<3>& item) const {
@@ -709,29 +709,16 @@ struct chunk_gated_delta_rule_v2_kernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Write inverse back to global workspace (lower including diagonal only).
-    CUTE_UNROLL
-    for (int m_idx = sg_id; m_idx < chunk_size; m_idx += sg_range) {
-      CUTE_UNROLL
-      for (int n_idx = sg_local_id; n_idx <= m_idx; n_idx += sub_group_size) {
-        L_ptr[m_idx * chunk_size + n_idx] =
-            static_cast<InverseType>(A_ptr_save[m_idx * chunk_size + n_idx]);
-      }
-    }
-
-    item.barrier(sycl::access::fence_space::global_and_local);
-
     // Fuse beta and cast to Element output.
     for (int col = local_id; col < chunk_size; col += local_range) {
       float bv = beta_chunk_ptr[col];
       CUTE_UNROLL
       for (int row = 0; row < chunk_size; ++row) {
         T_out_ptr[row * chunk_size + col] =
-            static_cast<T>(static_cast<float>(L_ptr[row * chunk_size + col]) * bv);
+            static_cast<T>(
+                static_cast<float>(A_ptr_save[row * chunk_size + col]) * bv);
       }
     }
-
-    item.barrier(sycl::access::fence_space::global_and_local);
   }
 
   // ============================================================================
@@ -922,6 +909,7 @@ struct chunk_gated_delta_rule_v2_kernel {
     // Stage 3: Inverse T = L^{-1} · diag(β), where L was built in Stage 2
     // =========================================================================
     compute_inverse_slm(T_ptr, L_ptr, beta_chunk_ptr, slm_ptr, item);
+    // compute_inverse(T_ptr, L_ptr, beta_chunk_ptr, item);
 
     // =========================================================================
     // Stage 4: SK = S×K^T (skip if first chunk & no initial state)
