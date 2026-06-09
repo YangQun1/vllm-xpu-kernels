@@ -205,6 +205,165 @@ CUTE_DEVICE void gemm_STS(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Subgroup-scoped, barrier-free variants of gemm_TTS / gemm_STS.
+//
+// These are intended for small per-subgroup block GEMMs (e.g. 16x16x16) where
+// a single sub-group owns the whole tile. They slice the TiledMMA/TiledCopy
+// with the sub-group-relative lane id (0..15) instead of the workgroup-global
+// local id, and they contain NO workgroup-level split barrier and NO global
+// prefetch. This makes it safe to call them from inside an `if (sg_id == N)`
+// branch so that different sub-groups can compute independent blocks
+// concurrently (wavefront parallelism) without dead-locking on a workgroup
+// barrier that only a subset of sub-groups would reach.
+//
+// Correctness note: the original gemm_TTS/gemm_STS use a workgroup split
+// barrier only to pipeline multi-k-tile prefetch across the whole workgroup.
+// For a single sub-group computing a single (or few) k-tile(s), the 2D block
+// load (`copy`), register `reorder` and `cute::gemm` (DPAS) are all
+// sub-group-local operations, so removing the barrier does not change results.
+template <
+    class ATensor,
+    class BTensor,
+    class SGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_TTS_sg(
+    ATensor const& A,  // (M,K)
+    BTensor const& B,  // (N,K)
+    SGCTensor& tCrC,   // (M,N)
+    int wg_m,          // m tile start id
+    int wg_n,          // n tile start id
+    TiledMMA const& mma) {
+  auto sg = sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_sub_group();
+  int sg_local_id = sg.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+  Tensor cB = make_identity_tensor(B.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto copy_a = get_block_2d_copy_A<void>(mma, A);
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+
+  auto thr_mma = mma.get_slice(sg_local_id);
+  auto thr_copy_a = copy_a.get_slice(sg_local_id);
+  auto thr_copy_b = copy_b.get_slice(sg_local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++) {
+    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+  }
+}
+
+template <
+    class ASGCTensor,
+    class BTensor,
+    class CSGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_STS_sg(
+    ASGCTensor const& tCrA,  // (M,K) already in registers
+    BTensor const& B,        // (N,K)
+    CSGCTensor& tCrC,        // (M,N)
+    int wg_m,                // m tile start id
+    int wg_n,                // n tile start id
+    TiledMMA const& mma) {
+  auto sg = sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_sub_group();
+  int sg_local_id = sg.get_local_linear_id();
+
+  Tensor cB = make_identity_tensor(B.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+
+  auto thr_mma = mma.get_slice(sg_local_id);
+  auto thr_copy_b = copy_b.get_slice(sg_local_id);
+
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  int k_tile_count = ceil_div(shape<1>(B), get<2>(wg_tile));
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++) {
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    reorder(tBrB, tCrB);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+  }
+}
+
+// Barrier-free, sub-group-scoped variant of gemm_TSS: C += A x B^T, where the
+// B operand is already in registers (tCrB) and A is loaded from global. Slices
+// by sg_local_id and contains no work-group barrier, so it is safe inside an
+// `if (sg_id == N)` branch.
+template <
+    class ATensor,
+    class BSGCTensor,
+    class CSGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_TSS_sg(
+    ATensor const& A,        // (M,K)
+    BSGCTensor const& tCrB,  // (N,K) already in registers
+    CSGCTensor& tCrC,        // (M,N)
+    int wg_m,                // m tile start id
+    int wg_n,                // n tile start id
+    TiledMMA const& mma) {
+  auto sg = sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_sub_group();
+  int sg_local_id = sg.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
+
+  auto copy_a = get_block_2d_copy_A<void>(mma, A);
+
+  auto thr_mma = mma.get_slice(sg_local_id);
+  auto thr_copy_a = copy_a.get_slice(sg_local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++) {
+    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+
+    reorder(tArA, tCrA);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+  }
+}
+
 template <
     class ATensor,
     class BSGCTensor,

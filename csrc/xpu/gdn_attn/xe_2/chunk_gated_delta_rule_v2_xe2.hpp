@@ -324,13 +324,18 @@ struct chunk_gated_delta_rule_v2_kernel {
     int local_id = item.get_local_linear_id();
     int local_range = item.get_local_range(2);
     auto sg = item.get_sub_group();
+    int sg_id = sg.get_group_linear_id();
     int sg_local_id = sg.get_local_linear_id();
 
     MmaInverse mma_inv{};
 
     // ===== Step 1: 4 diagonal 16×16 blocks: forward substitution (pure inverse, no beta) =====
-    CUTE_UNROLL
-    for (int i = 0; i < 4; ++i) {
+    // Distribute the 4 independent diagonal blocks across the first 4 sub-groups
+    // (sg_id 0..3). Previously every sub-group recomputed all 4 blocks (8x
+    // redundant work + write races on the same global addresses); now each
+    // block is computed exactly once by its owning sub-group.
+    if (sg_id < 4) {
+      int i = sg_id;
       int offset = i * 16;
       InverseType* A_ptr_xx = L_ptr + offset * chunk_size + offset;
       float A_local[16];
@@ -404,18 +409,30 @@ struct chunk_gated_delta_rule_v2_kernel {
 
     auto A_XX_tensor_shape = make_shape(16, 16);
 
-    auto thr_mma_inv = mma_inv.get_slice(local_id);
+    // Step 2 uses subgroup-relative slicing (sg_local_id, 0..15) instead of the
+    // global local_id (0..127), so that each owning sub-group partitions the
+    // 16x16 MMA/copy correctly. For now the whole of Step 2 is still executed
+    // only by sub-group 0 (if (sg_id == 0)); the workgroup barriers between
+    // blocks stay at workgroup scope so all sub-groups participate.
+    auto thr_mma_inv = mma_inv.get_slice(sg_local_id);
     auto wg_tile_inv = mma_inv.tile_mnk();
 
     // Identity tensor + partition for C accumulator and copy-D
     Tensor cC_inv = make_identity_tensor(A_XX_tensor_shape);
     Tensor gC_inv = local_tile(cC_inv, wg_tile_inv, make_coord(0, 0, 0), Step<_1, _1, X>{});
     auto tCrC_inv = thr_mma_inv.partition_sg_fragment_C(gC_inv);
+    // Second C accumulator: holds the left-multiplied result (D x inner) for
+    // multi-term blocks, computed entirely in registers (no global round-trip).
+    auto tCrC_acc = thr_mma_inv.partition_sg_fragment_C(gC_inv);
 
     // A partition for register-to-register transfer (for gemm_STS)
     Tensor cA_inv = make_identity_tensor(A_XX_tensor_shape);
     Tensor gA_inv = local_tile(cA_inv, select<0, 2>(wg_tile_inv), make_coord(0, _));
     auto tCrA_inv = thr_mma_inv.partition_sg_fragment_A(gA_inv(_, _, 0));
+    // B partition: multi-term blocks reorder inner^T (C-fragment) into a B
+    // operand so gemm_TSS_sg can left-multiply by the diagonal block.
+    Tensor gB_inv = local_tile(cA_inv, select<1, 2>(wg_tile_inv), make_coord(0, _));
+    auto tCrB_inv = thr_mma_inv.partition_sg_fragment_B(gB_inv(_, _, 0));
 
     // Sub-block pointers
     auto T_ptr_11 = L_ptr;
@@ -473,15 +490,13 @@ struct chunk_gated_delta_rule_v2_kernel {
     auto T_43_tensor = make_tensor(make_gmem_ptr(T_ptr_43),
         make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
 
-    // Transposed tensors for T_41/T_42 (used as B operand in left-mult step)
+    // Transposed T_41/T_42 (read back the stored inner as B operand)
     auto T_41_tensor_T = make_tensor(make_gmem_ptr(T_ptr_41),
         make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
     auto T_42_tensor_T = make_tensor(make_gmem_ptr(T_ptr_42),
         make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
 
-    // L tensors (row-major)
-    auto KK_21_tensor = make_tensor(make_gmem_ptr(L_ptr_21),
-        make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
+    // KK row-major tensors (A operand of the inner KK_a×T_b products)
     auto KK_31_tensor = make_tensor(make_gmem_ptr(L_ptr_31),
         make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
     auto KK_32_tensor = make_tensor(make_gmem_ptr(L_ptr_32),
@@ -493,7 +508,7 @@ struct chunk_gated_delta_rule_v2_kernel {
     auto KK_43_tensor = make_tensor(make_gmem_ptr(L_ptr_43),
         make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
 
-    // KK transposed tensors (for B operand in left-multiplication step)
+    // KK transposed tensors (B operand for the single-term blocks)
     auto KK_21_tensor_T = make_tensor(make_gmem_ptr(L_ptr_21),
         make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
     auto KK_32_tensor_T = make_tensor(make_gmem_ptr(L_ptr_32),
@@ -501,133 +516,136 @@ struct chunk_gated_delta_rule_v2_kernel {
     auto KK_43_tensor_T = make_tensor(make_gmem_ptr(L_ptr_43),
         make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
 
-    // Block (1,0): T_21 = -(T_22 × KK_21 × T_11)
-    // Two-step via registers: temp = T_22 × KK_21, then T_21 = -(temp × T_11)
-    {
+    // ---- Chain-bound solve: one dependency chain pinned per sub-group ----
+    // Every cross-level handoff inside a chain (T_21->T_31->T_41 on sg0,
+    // T_32->T_42 on sg1) is produced and consumed by the SAME sub-group, so it
+    // only needs a sub-group barrier (the producing/consuming lanes are all in
+    // that sub-group), NOT a work-group barrier. The three chains therefore run
+    // fully concurrently with no inter-level rendezvous; a single work-group
+    // barrier afterwards makes every block visible work-group-wide before
+    // Step 3. Numerically identical to the per-level version (same GEMM and
+    // truncation sequence); only the synchronization is relaxed.
+    //   chain A (sg0): T_21 -> T_31 -> T_41
+    //   chain B (sg1): T_32 -> T_42
+    //   chain C (sg2): T_43
+    if (sg_id == 0) {
+      // ----- T_21 = -(T_22 × KK_21 × T_11) -----
       auto copy_D_21 = get_block_2d_copy_D<void>(mma_inv, T_21_tensor);
-      auto thr_copy_D_21 = copy_D_21.get_slice(local_id);
+      auto thr_copy_D_21 = copy_D_21.get_slice(sg_local_id);
       auto tCrD_21 = thr_copy_D_21.partition_sg_fragment_S(gC_inv);
       auto tCgD_21 = thr_copy_D_21.partition_D(gC_inv);
-      // step 1: tCrC = T_22 × KK_21 (via gemm_TTS: C[m,n] = T_22[m,k] × KK_21[n,k])
       clear(tCrC_inv);
-      gemm_TTS(T_22_tensor, KK_21_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      // step 2: move to A register, then gemm_STS: tCrC = (T_22×KK_21) × T_11
+      gemm_TTS_sg(T_22_tensor, KK_21_tensor_T, tCrC_inv, 0, 0, mma_inv);
       reorder(tCrC_inv, tCrA_inv);
       clear(tCrC_inv);
-      gemm_STS(tCrA_inv, T_11_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_STS_sg(tCrA_inv, T_11_tensor_T, tCrC_inv, 0, 0, mma_inv);
       CUTE_UNROLL
       for (int i = 0; i < tCrC_inv.size(); ++i) {
         tCrC_inv(i) *= -1.0f;
       }
       reorder(tCrC_inv, tCrD_21);
       copy(copy_D_21, tCrD_21, tCgD_21);
-    }
-    item.barrier(sycl::access::fence_space::global_and_local);
 
-    // Block (2,0): T_31 = -T_33 × (KK_31×T_11 + KK_32×T_21)
-    // Two-step via global memory:
-    //   step 1: temp = KK_31×T_11 + KK_32×T_21 → write to T_31 pos
-    //   step 2: T_31 = -T_33 × temp (read from T_31 pos)
-    {
+      // T_21 just written to global; make it visible to this sub-group's lanes
+      // before T_31/T_41 read it back transposed (intra-sub-group handoff).
+      sycl::group_barrier(sg);
+
+      // ----- T_31 = -T_33 × (KK_31×T_11 + KK_32×T_21) -----
       auto copy_D_31 = get_block_2d_copy_D<void>(mma_inv, T_31_tensor);
-      auto thr_copy_D_31 = copy_D_31.get_slice(local_id);
+      auto thr_copy_D_31 = copy_D_31.get_slice(sg_local_id);
       auto tCrD_31 = thr_copy_D_31.partition_sg_fragment_S(gC_inv);
       auto tCgD_31 = thr_copy_D_31.partition_D(gC_inv);
-      // step 1: temp
+      // step 1: inner^T = T_11^T×KK_31^T + T_21^T×KK_32^T (fp32 accumulate).
+      //   gemm_TTS_sg(A,B): C[m,n] = Σ_k A[m,k]·B[n,k]. With A = T_xx^T and
+      //   B = KK_xx, this yields the inner-product transpose accumulated in C.
       clear(tCrC_inv);
-      gemm_TTS(KK_31_tensor, T_11_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      gemm_TTS(KK_32_tensor, T_21_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      reorder(tCrC_inv, tCrD_31);
-      copy(copy_D_31, tCrD_31, tCgD_31);  // write temp to T_31 position
-      // step 2: left-multiply by T_33
-      clear(tCrC_inv);
-      gemm_TTS(T_33_tensor, T_31_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_11_tensor_T, KK_31_tensor, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_21_tensor_T, KK_32_tensor, tCrC_inv, 0, 0, mma_inv);
+      reorder(tCrC_inv, tCrB_inv);
+      // step 2: T_31 = -T_33 × inner = -T_33 × (inner^T)^T, fully in registers.
+      clear(tCrC_acc);
+      gemm_TSS_sg(T_33_tensor, tCrB_inv, tCrC_acc, 0, 0, mma_inv);
       CUTE_UNROLL
-      for (int i = 0; i < tCrC_inv.size(); ++i) {
-        tCrC_inv(i) *= -1.0f;
+      for (int i = 0; i < tCrC_acc.size(); ++i) {
+        tCrC_acc(i) *= -1.0f;
       }
-      reorder(tCrC_inv, tCrD_31);
-      copy(copy_D_31, tCrD_31, tCgD_31);  // write final T_31
-    }
-    item.barrier(sycl::access::fence_space::global_and_local);
+      reorder(tCrC_acc, tCrD_31);
+      copy(copy_D_31, tCrD_31, tCgD_31);
 
-    // Block (3,0): T_41 = -T_44 × (KK_41×T_11 + KK_42×T_21 + KK_43×T_31)
-    {
+      // T_31 written; make it visible before T_41 reads it back transposed.
+      sycl::group_barrier(sg);
+
+      // ----- T_41 = -T_44 × (KK_41×T_11 + KK_42×T_21 + KK_43×T_31) -----
       auto copy_D_41 = get_block_2d_copy_D<void>(mma_inv, T_41_tensor);
-      auto thr_copy_D_41 = copy_D_41.get_slice(local_id);
+      auto thr_copy_D_41 = copy_D_41.get_slice(sg_local_id);
       auto tCrD_41 = thr_copy_D_41.partition_sg_fragment_S(gC_inv);
       auto tCgD_41 = thr_copy_D_41.partition_D(gC_inv);
+      // step 1: inner^T = T_11^T×KK_41^T + T_21^T×KK_42^T + T_31^T×KK_43^T
       clear(tCrC_inv);
-      gemm_TTS(KK_41_tensor, T_11_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      gemm_TTS(KK_42_tensor, T_21_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      gemm_TTS(KK_43_tensor, T_31_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      reorder(tCrC_inv, tCrD_41);
-      copy(copy_D_41, tCrD_41, tCgD_41);  // write temp
-      clear(tCrC_inv);
-      gemm_TTS(T_44_tensor, T_41_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_11_tensor_T, KK_41_tensor, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_21_tensor_T, KK_42_tensor, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_31_tensor_T, KK_43_tensor, tCrC_inv, 0, 0, mma_inv);
+      reorder(tCrC_inv, tCrB_inv);
+      // step 2: T_41 = -T_44 × inner, fully in registers.
+      clear(tCrC_acc);
+      gemm_TSS_sg(T_44_tensor, tCrB_inv, tCrC_acc, 0, 0, mma_inv);
       CUTE_UNROLL
-      for (int i = 0; i < tCrC_inv.size(); ++i) {
-        tCrC_inv(i) *= -1.0f;
+      for (int i = 0; i < tCrC_acc.size(); ++i) {
+        tCrC_acc(i) *= -1.0f;
       }
-      reorder(tCrC_inv, tCrD_41);
-      copy(copy_D_41, tCrD_41, tCgD_41);  // write final T_41
-    }
-    item.barrier(sycl::access::fence_space::global_and_local);
-
-
-    // Block (2,1): T_32 = -(T_33 × KK_32 × T_22)
-    {
+      reorder(tCrC_acc, tCrD_41);
+      copy(copy_D_41, tCrD_41, tCgD_41);
+    } else if (sg_id == 1) {
+      // ----- T_32 = -(T_33 × KK_32 × T_22) -----
       auto copy_D_32 = get_block_2d_copy_D<void>(mma_inv, T_32_tensor);
-      auto thr_copy_D_32 = copy_D_32.get_slice(local_id);
+      auto thr_copy_D_32 = copy_D_32.get_slice(sg_local_id);
       auto tCrD_32 = thr_copy_D_32.partition_sg_fragment_S(gC_inv);
       auto tCgD_32 = thr_copy_D_32.partition_D(gC_inv);
       clear(tCrC_inv);
-      gemm_TTS(T_33_tensor, KK_32_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_33_tensor, KK_32_tensor_T, tCrC_inv, 0, 0, mma_inv);
       reorder(tCrC_inv, tCrA_inv);
       clear(tCrC_inv);
-      gemm_STS(tCrA_inv, T_22_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_STS_sg(tCrA_inv, T_22_tensor_T, tCrC_inv, 0, 0, mma_inv);
       CUTE_UNROLL
       for (int i = 0; i < tCrC_inv.size(); ++i) {
         tCrC_inv(i) *= -1.0f;
       }
       reorder(tCrC_inv, tCrD_32);
       copy(copy_D_32, tCrD_32, tCgD_32);
-    }
-    item.barrier(sycl::access::fence_space::global_and_local);
 
-    // Block (3,1): T_42 = -T_44 × (KK_42×T_22 + KK_43×T_32)
-    {
+      // T_32 written; make it visible before T_42 reads it back transposed.
+      sycl::group_barrier(sg);
+
+      // ----- T_42 = -T_44 × (KK_42×T_22 + KK_43×T_32) -----
       auto copy_D_42 = get_block_2d_copy_D<void>(mma_inv, T_42_tensor);
-      auto thr_copy_D_42 = copy_D_42.get_slice(local_id);
+      auto thr_copy_D_42 = copy_D_42.get_slice(sg_local_id);
       auto tCrD_42 = thr_copy_D_42.partition_sg_fragment_S(gC_inv);
       auto tCgD_42 = thr_copy_D_42.partition_D(gC_inv);
+      // step 1: inner^T = T_22^T×KK_42^T + T_32^T×KK_43^T (fp32 accumulate)
       clear(tCrC_inv);
-      gemm_TTS(KK_42_tensor, T_22_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      gemm_TTS(KK_43_tensor, T_32_tensor_T, tCrC_inv, 0, 0, mma_inv);
-      reorder(tCrC_inv, tCrD_42);
-      copy(copy_D_42, tCrD_42, tCgD_42);  // write temp
-      clear(tCrC_inv);
-      gemm_TTS(T_44_tensor, T_42_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_22_tensor_T, KK_42_tensor, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_32_tensor_T, KK_43_tensor, tCrC_inv, 0, 0, mma_inv);
+      reorder(tCrC_inv, tCrB_inv);
+      // step 2: T_42 = -T_44 × inner, fully in registers.
+      clear(tCrC_acc);
+      gemm_TSS_sg(T_44_tensor, tCrB_inv, tCrC_acc, 0, 0, mma_inv);
       CUTE_UNROLL
-      for (int i = 0; i < tCrC_inv.size(); ++i) {
-        tCrC_inv(i) *= -1.0f;
+      for (int i = 0; i < tCrC_acc.size(); ++i) {
+        tCrC_acc(i) *= -1.0f;
       }
-      reorder(tCrC_inv, tCrD_42);
-      copy(copy_D_42, tCrD_42, tCgD_42);  // write final T_42
-    }
-    item.barrier(sycl::access::fence_space::global_and_local);
-
-    // Block (3,2): T_43 = -(T_44 × KK_43 × T_33)
-    {
+      reorder(tCrC_acc, tCrD_42);
+      copy(copy_D_42, tCrD_42, tCgD_42);
+    } else if (sg_id == 2) {
+      // ----- T_43 = -(T_44 × KK_43 × T_33) -----
       auto copy_D_43 = get_block_2d_copy_D<void>(mma_inv, T_43_tensor);
-      auto thr_copy_D_43 = copy_D_43.get_slice(local_id);
+      auto thr_copy_D_43 = copy_D_43.get_slice(sg_local_id);
       auto tCrD_43 = thr_copy_D_43.partition_sg_fragment_S(gC_inv);
       auto tCgD_43 = thr_copy_D_43.partition_D(gC_inv);
       clear(tCrC_inv);
-      gemm_TTS(T_44_tensor, KK_43_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_TTS_sg(T_44_tensor, KK_43_tensor_T, tCrC_inv, 0, 0, mma_inv);
       reorder(tCrC_inv, tCrA_inv);
       clear(tCrC_inv);
-      gemm_STS(tCrA_inv, T_33_tensor_T, tCrC_inv, 0, 0, mma_inv);
+      gemm_STS_sg(tCrA_inv, T_33_tensor_T, tCrC_inv, 0, 0, mma_inv);
       CUTE_UNROLL
       for (int i = 0; i < tCrC_inv.size(); ++i) {
         tCrC_inv(i) *= -1.0f;
@@ -908,8 +926,8 @@ struct chunk_gated_delta_rule_v2_kernel {
     // =========================================================================
     // Stage 3: Inverse T = L^{-1} · diag(β), where L was built in Stage 2
     // =========================================================================
-    compute_inverse_slm(T_ptr, L_ptr, beta_chunk_ptr, slm_ptr, item);
-    // compute_inverse(T_ptr, L_ptr, beta_chunk_ptr, item);
+    // compute_inverse_slm(T_ptr, L_ptr, beta_chunk_ptr, slm_ptr, item);
+    compute_inverse(T_ptr, L_ptr, beta_chunk_ptr, item);
 
     // =========================================================================
     // Stage 4: SK = S×K^T (skip if first chunk & no initial state)
