@@ -803,11 +803,9 @@ struct chunk_gated_delta_rule_v2_kernel {
         make_gmem_ptr(QK_ptr),
         make_layout(QK_tensor_shape, make_stride(chunk_size, _1{})));
 
-    // Inverse workspace (InverseType): stores L, then overwritten by T_pure
-    auto L_ptr = l_buf +
-           static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
-           chunk_offset * chunk_size;
-    // T_out buffer (Element): stores final T_out = L^{-1}·diag(beta)
+    // T_out buffer (Element): T = L^{-1}·diag(β). Produced by the separate
+    // chunk-parallel front kernel (run_front / compute_front_body); here it is
+    // only read back by Stage 5.
     auto T_ptr = t_buf +
            static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
            chunk_offset * chunk_size;
@@ -862,72 +860,12 @@ struct chunk_gated_delta_rule_v2_kernel {
       copy(copy_QK_d, tCrQK_d, tCgQK_d);
     }
 
-    // Compute KK = K×K^T (for inverse)
-    {
-      MmaKK mma_kk{};
-      auto thr_mma = mma_kk.get_slice(local_id);
-      auto wg_tile = mma_kk.tile_mnk();
-
-      static constexpr auto tile_m = get<0>(wg_tile);
-      static constexpr auto tile_n = get<1>(wg_tile);
-      static constexpr auto ATOM_M = get<1>(typename MmaKK::ThrLayoutVMNK{}.shape());
-      static constexpr auto ATOM_N = get<2>(typename MmaKK::ThrLayoutVMNK{}.shape());
-      static constexpr auto SG_M = tile_m / ATOM_M;
-      static constexpr auto SG_N = tile_n / ATOM_N;
-
-      auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
-      auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
-      int m_sg_start = sg_local_m_coord * SG_M;
-      int n_sg_start = sg_local_n_coord * SG_N;
-
-      auto KK_tensor_shape = make_shape(chunk_size, chunk_size);
-      auto KK_tensor = make_tensor(
-          make_gmem_ptr(L_ptr),  // write L (InverseType) for inverse stage
-          make_layout(KK_tensor_shape, make_stride(chunk_size, _1{})));
-
-      Tensor cKK = make_identity_tensor(KK_tensor_shape);
-      Tensor gKK_C = local_tile(cKK, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
-      auto copy_KK_d = get_block_2d_copy_D<void>(mma_kk, KK_tensor);
-      auto thr_copy_KK_d = copy_KK_d.get_slice(local_id);
-      auto tCrKK_d = thr_copy_KK_d.partition_sg_fragment_S(gKK_C);
-      auto tCgKK_d = thr_copy_KK_d.partition_D(gKK_C);
-      auto tSrKK = thr_mma.partition_sg_fragment_C(gKK_C);
-
-      clear(tSrKK);
-      gemm_TTS(K_tensor, K_tensor, tSrKK, 0, 0, mma_kk);
-
-      // Fused causal mask + gate scaling for KK: scale by e^(g_i-g_j)·β_i
-      // Build L = I + strict_lower(KK) directly here
-      CUTE_UNROLL
-      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-        int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
-        CUTE_UNROLL
-        for (int sm = 0; sm < SG_M; ++sm) {
-          int m_idx = m_sg_start + sm;
-          if (m_idx > n_idx) {
-            float gate_scale = sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
-            float beta_val = beta_chunk_ptr[m_idx];
-            tSrKK(sn * SG_M + sm) *= gate_scale * beta_val;
-          } else if (m_idx == n_idx) {
-            tSrKK(sn * SG_M + sm) = 1.0f;
-          } else {
-            // Upper triangle stays 0
-            tSrKK(sn * SG_M + sm) = 0.0f;
-          }
-        }
-      }
-
-      reorder(tSrKK, tCrKK_d);
-      copy(copy_KK_d, tCrKK_d, tCgKK_d);
-    }
-
+    // NOTE: KK→L build and the inverse (T = L^{-1}·diag(β)) have been moved out
+    // of this fused kernel into a separate chunk-parallel front kernel
+    // (run_front / compute_front_body) for higher occupancy. T is read back
+    // from t_buf in Stage 5. The barrier below makes the QK write to qk_buf
+    // visible to the later stages of this work-group.
     item.barrier(sycl::access::fence_space::global_and_local);
-
-    // =========================================================================
-    // Stage 3: Inverse T = L^{-1} · diag(β), where L was built in Stage 2
-    // =========================================================================
-    // compute_inverse_slm(T_ptr, L_ptr, beta_chunk_ptr, slm_ptr, item);
-    compute_inverse(T_ptr, L_ptr, beta_chunk_ptr, item);
 
     // =========================================================================
     // Stage 4: SK = S×K^T (skip if first chunk & no initial state)
@@ -1280,6 +1218,161 @@ struct chunk_gated_delta_rule_v2_kernel {
   }
 
   // ============================================================================
+  // Front kernel body: per-chunk L build + inverse (chunk-parallel).
+  // Computes, for ONE chunk: alpha channels (Stage 1) -> L = I +
+  // strict_lower(e^(g_i-g_j)·β_i · K×K^T) (Stage 2 KK only) -> T = L^{-1}·diag(β)
+  // (Stage 3 inverse) into t_buf. This is the work that was previously fused
+  // into compute_loop_body; it is hoisted out so it can run with a
+  // chunk×head grid for much higher occupancy than the (batch,head) grid of
+  // the recurrent back kernel.
+  // ============================================================================
+  CUTE_DEVICE void compute_front_body(
+      int chunk_offset,
+      int current_chunk_size,
+      int v_head_id,
+      int kv_head_id,
+      float* slm_ptr,
+      sycl::nd_item<3>& item) const {
+    int local_id = item.get_local_linear_id();
+    auto sg = item.get_sub_group();
+    int sg_local_id = sg.get_local_linear_id();
+
+    float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
+
+    const float* alpha_chunk_ptr =
+        alpha + static_cast<int64_t>(v_head_id) * total_virtual_seqlen +
+        chunk_offset;
+    const float* beta_chunk_ptr =
+        beta + static_cast<int64_t>(v_head_id) * total_virtual_seqlen +
+        chunk_offset;
+
+    // Stage 1: alpha preprocessing (cumsum_log / cumprod into SLM).
+    compute_alpha_channels(slm_ptr, alpha_chunk_ptr, current_chunk_size, item);
+
+    // K tensor for this chunk.
+    auto k_ptr_chunk =
+        k + static_cast<int64_t>(chunk_offset) * num_k_heads * head_k_dim +
+        kv_head_id * head_k_dim;
+    auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+    auto K_tensor = make_tensor(
+        make_gmem_ptr(k_ptr_chunk),
+        make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+
+    // L workspace (InverseType) and T output (Element) for this chunk.
+    auto L_ptr = l_buf +
+           static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
+           chunk_offset * chunk_size;
+    auto T_ptr = t_buf +
+           static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
+           chunk_offset * chunk_size;
+
+    // Stage 2 (KK only): build L = I + strict_lower(e^(g_i-g_j)·β_i · K×K^T).
+    {
+      MmaKK mma_kk{};
+      auto thr_mma = mma_kk.get_slice(local_id);
+      auto wg_tile = mma_kk.tile_mnk();
+
+      static constexpr auto tile_m = get<0>(wg_tile);
+      static constexpr auto tile_n = get<1>(wg_tile);
+      static constexpr auto ATOM_M = get<1>(typename MmaKK::ThrLayoutVMNK{}.shape());
+      static constexpr auto ATOM_N = get<2>(typename MmaKK::ThrLayoutVMNK{}.shape());
+      static constexpr auto SG_M = tile_m / ATOM_M;
+      static constexpr auto SG_N = tile_n / ATOM_N;
+
+      auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
+      auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
+      int m_sg_start = sg_local_m_coord * SG_M;
+      int n_sg_start = sg_local_n_coord * SG_N;
+
+      auto KK_tensor_shape = make_shape(chunk_size, chunk_size);
+      auto KK_tensor = make_tensor(
+          make_gmem_ptr(L_ptr),  // write L (InverseType) for inverse stage
+          make_layout(KK_tensor_shape, make_stride(chunk_size, _1{})));
+
+      Tensor cKK = make_identity_tensor(KK_tensor_shape);
+      Tensor gKK_C = local_tile(cKK, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+      auto copy_KK_d = get_block_2d_copy_D<void>(mma_kk, KK_tensor);
+      auto thr_copy_KK_d = copy_KK_d.get_slice(local_id);
+      auto tCrKK_d = thr_copy_KK_d.partition_sg_fragment_S(gKK_C);
+      auto tCgKK_d = thr_copy_KK_d.partition_D(gKK_C);
+      auto tSrKK = thr_mma.partition_sg_fragment_C(gKK_C);
+
+      clear(tSrKK);
+      gemm_TTS(K_tensor, K_tensor, tSrKK, 0, 0, mma_kk);
+
+      CUTE_UNROLL
+      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+        int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
+        CUTE_UNROLL
+        for (int sm = 0; sm < SG_M; ++sm) {
+          int m_idx = m_sg_start + sm;
+          if (m_idx > n_idx) {
+            float gate_scale = sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
+            float beta_val = beta_chunk_ptr[m_idx];
+            tSrKK(sn * SG_M + sm) *= gate_scale * beta_val;
+          } else if (m_idx == n_idx) {
+            tSrKK(sn * SG_M + sm) = 1.0f;
+          } else {
+            tSrKK(sn * SG_M + sm) = 0.0f;
+          }
+        }
+      }
+
+      reorder(tSrKK, tCrKK_d);
+      copy(copy_KK_d, tCrKK_d, tCgKK_d);
+    }
+
+    item.barrier(sycl::access::fence_space::global_and_local);
+
+    // Stage 3: inverse T = L^{-1}·diag(β). compute_inverse ends with its own
+    // work-group barrier, so the SLM is safe to reuse on the next chunk.
+    compute_inverse(T_ptr, L_ptr, beta_chunk_ptr, item);
+  }
+
+  // ============================================================================
+  // Front kernel entry: chunk×head persistent grid (mirrors V1 inverse kernel).
+  // group(1) encodes (chunk_global * num_v_heads + v_head); each work-group
+  // strides over chunks by global_chunk_range to cover the variable-length
+  // virtual sequence.
+  // ============================================================================
+  void run_front(sycl::nd_item<3> item, float* slm_ptr) const {
+    const int v_head_id = item.get_group(1) % num_v_heads;
+    int chunk_id = item.get_group(1) / num_v_heads;
+    const int global_chunk_range = item.get_group_range(1) / num_v_heads;
+
+    const int kv_ratio = num_v_heads / num_k_heads;
+    const int kv_head_id = v_head_id / kv_ratio;
+
+    int pre_chunks = 0;
+    for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
+      const int seq_start_offset = query_start_loc[batch_id];
+      const int seq_end_offset = query_start_loc[batch_id + 1];
+      const int seq_len = seq_end_offset - seq_start_offset;
+      const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
+      const int cumsum_chunks = pre_chunks + current_chunks;
+
+      if (chunk_id >= cumsum_chunks) {
+        pre_chunks = cumsum_chunks;
+        continue;
+      }
+
+      while (chunk_id < cumsum_chunks) {
+        const int local_chunk = chunk_id - pre_chunks;
+        const int chunk_offset = chunk_id * chunk_size;
+        int current_chunk_size = chunk_size;
+        if ((local_chunk + 1) * chunk_size > seq_len) {
+          current_chunk_size = seq_len - local_chunk * chunk_size;
+        }
+        compute_front_body(
+            chunk_offset, current_chunk_size, v_head_id, kv_head_id,
+            slm_ptr, item);
+        chunk_id += global_chunk_range;
+      }
+      pre_chunks = cumsum_chunks;
+    }
+  }
+
+  // ============================================================================
   // Kernel entry with SLM (called from launcher)
   // ============================================================================
   void operator()(
@@ -1358,6 +1451,22 @@ struct chunk_gated_delta_rule_v2_kernel {
     return sycl::nd_range<3>{global * local, local};
   }
 
+  // Front kernel launch config: chunk×head persistent grid. Same thread count
+  // (128) as the main kernel so the KK build and inverse partition identically;
+  // the grid is sized to fill the device (mirrors V1's inverse kernel).
+  static sycl::nd_range<3> get_front_nd_range(int num_v_heads) {
+    MmaO1 mma_o1{};
+    int threads_per_wg = size(mma_o1);
+    int sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+    int num_wg =
+        (sm_count * MaxThreadsPerSM / threads_per_wg + num_v_heads - 1) /
+        num_v_heads * num_v_heads;
+    sycl::range<3> local(1, 1, threads_per_wg);
+    sycl::range<3> global(1, num_wg, 1);
+    return sycl::nd_range<3>{global * local, local};
+  }
+
   static int get_slm_size() {
     return slm_total_size;
   }
@@ -1368,6 +1477,9 @@ struct chunk_gated_delta_rule_v2_kernel {
 // ============================================================================
 template <typename T, typename StateT>
 class ChunkGDNV2Kernel;
+
+template <typename T, typename StateT>
+class ChunkGDNV2FrontKernel;
 
 // ============================================================================
 // Launcher function
@@ -1457,6 +1569,27 @@ void kernel_launcher_v2(
       head_k_dim,
       num_v_heads,
       head_v_dim};
+
+  // -------------------------------------------------------------------------
+  // Step 1b: Launch chunk-parallel front kernel (L build + inverse -> t_buf).
+  // Runs after prepare (needs alpha_buf) and before the main kernel (which
+  // reads t_buf in Stage 5). Reuses the same Kernel struct/params; only the
+  // grid and the entry point (run_front) differ.
+  // -------------------------------------------------------------------------
+  {
+    auto front_range = Kernel::get_front_nd_range(num_v_heads);
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
+      cgh.parallel_for<ChunkGDNV2FrontKernel<T, StateT>>(
+          front_range,
+          kernel_props,
+          [=](sycl::nd_item<3> item) {
+            float* slm_ptr = static_cast<float*>(
+                local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
+            kernel_obj.run_front(item, slm_ptr);
+          });
+    });
+  }
 
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
