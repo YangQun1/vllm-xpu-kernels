@@ -17,6 +17,7 @@ using namespace cute;
 static constexpr int sub_group_size = 16;
 static constexpr int chunk_size = gdn::chunk_size_xe2;  // 64
 static constexpr int MaxThreadsPerSM = 512;
+static constexpr int MaxThreadsPerSM_grf128 = 1024;
 using InverseType = half_t;
 static_assert(
   std::is_same_v<InverseType, half_t> ||
@@ -247,12 +248,18 @@ struct chunk_gated_delta_rule_v2_kernel {
 
   // ============================================================================
   // Alpha 3-channel preprocessing (design §2.7 item 2)
-  // Computes: cumsum_log, cumprod from alpha (linear space)
+  // Computes cumsum_log, cumprod from alpha (linear space) into SLM AND persists
+  // both channels to global scratch (cumsum_log_buf / cumprod_buf) in the same
+  // pass, so the recurrent back kernel can reload them via load_alpha_channels
+  // instead of recomputing the log2/scan/exp2 (design: Option A). Folding the
+  // store here avoids a second SLM-read pass over the freshly written channels.
   // ============================================================================
   CUTE_DEVICE void compute_alpha_channels(
       float* slm_ptr,
       const float* alpha_chunk_ptr,
       int current_chunk_size,
+      int v_head_id,
+      int chunk_offset,
       sycl::nd_item<3>& item) const {
     auto sg = item.get_sub_group();
     int sg_local_id = sg.get_local_linear_id();
@@ -261,6 +268,10 @@ struct chunk_gated_delta_rule_v2_kernel {
 
     float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
     float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
+    float* g_cumsum_log = cumsum_log_buf +
+        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
+    float* g_cumprod = cumprod_buf +
+        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
     // Each sub-group element handles chunk_size/sub_group_size elements
     constexpr int local_num = chunk_size / sub_group_size;
     float log_local[local_num] = {};
@@ -291,49 +302,31 @@ struct chunk_gated_delta_rule_v2_kernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Compute cumprod = exp2(cumsum_log)
+    // Compute cumprod = exp2(cumsum_log) and persist the valid (non-padding)
+    // channels to global. Padding elements (e >= current_chunk_size) are written
+    // to global in the next loop instead, so each global slot is written once.
     CUTE_UNROLL
     for (int e = local_id; e < chunk_size; e += local_range) {
       float cs_log = cumsum_log_ptr[e];
       float cp = sycl::exp2(cs_log);
       cumprod_ptr[e] = cp;
+      if (e < current_chunk_size) {
+        g_cumsum_log[e] = cs_log;
+        g_cumprod[e] = cp;
+      }
     }
 
-    // Zero out elements beyond current_chunk_size
+    // Zero out elements beyond current_chunk_size (SLM + global).
     CUTE_UNROLL
     for (int e = current_chunk_size + local_id; e < chunk_size; e += local_range) {
-      cumsum_log_ptr[e] = cumsum_log_ptr[current_chunk_size - 1];
+      float cs_pad = cumsum_log_ptr[current_chunk_size - 1];
+      cumsum_log_ptr[e] = cs_pad;
       cumprod_ptr[e] = 0.0f;
+      g_cumsum_log[e] = cs_pad;
+      g_cumprod[e] = 0.0f;
     }
 
     item.barrier(sycl::access::fence_space::local_space);
-  }
-
-  // ============================================================================
-  // Persist the alpha channels (cumsum_log, cumprod) from SLM to global scratch.
-  // Called by the front kernel after compute_alpha_channels so the recurrent
-  // back kernel can reload them instead of recomputing the log2/scan/exp2.
-  // Precondition: compute_alpha_channels has populated SLM and issued its
-  // trailing local barrier (SLM is consistent across the work-group).
-  // ============================================================================
-  CUTE_DEVICE void store_alpha_channels(
-      const float* slm_ptr,
-      int v_head_id,
-      int chunk_offset,
-      sycl::nd_item<3>& item) const {
-    int local_id = item.get_local_linear_id();
-    int local_range = item.get_local_range(2);
-    const float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
-    const float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
-    float* g_cumsum_log = cumsum_log_buf +
-        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
-    float* g_cumprod = cumprod_buf +
-        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
-    CUTE_UNROLL
-    for (int e = local_id; e < chunk_size; e += local_range) {
-      g_cumsum_log[e] = cumsum_log_ptr[e];
-      g_cumprod[e] = cumprod_ptr[e];
-    }
   }
 
   // ============================================================================
@@ -1300,12 +1293,12 @@ struct chunk_gated_delta_rule_v2_kernel {
         beta + static_cast<int64_t>(v_head_id) * total_virtual_seqlen +
         chunk_offset;
 
-    // Stage 1: alpha preprocessing (cumsum_log / cumprod into SLM).
-    compute_alpha_channels(slm_ptr, alpha_chunk_ptr, current_chunk_size, item);
-
-    // Persist both channels to global scratch so the recurrent back kernel can
-    // reload them instead of recomputing the log2/scan/exp2 (design: Option A).
-    store_alpha_channels(slm_ptr, v_head_id, chunk_offset, item);
+    // Stage 1: alpha preprocessing — compute cumsum_log / cumprod into SLM and
+    // persist both channels to global scratch (cumsum_log_buf / cumprod_buf) so
+    // the recurrent back kernel can reload them (design: Option A).
+    compute_alpha_channels(
+        slm_ptr, alpha_chunk_ptr, current_chunk_size, v_head_id, chunk_offset,
+        item);
 
     // K tensor for this chunk.
     auto k_ptr_chunk =
@@ -1357,16 +1350,37 @@ struct chunk_gated_delta_rule_v2_kernel {
       clear(tSrKK);
       gemm_TTS(K_tensor, K_tensor, tSrKK, 0, 0, mma_kk);
 
+      // Hoist the m-indexed SLM/global reads out of the (sn, sm) epilogue loop.
+      // cumsum_log[m_idx] and beta[m_idx] depend only on sm, but the original
+      // loop re-read them once per sn (SG_N/16 times each) — that was the source
+      // of the ~29x SLM read traffic. Preload them once into registers; the
+      // n-indexed cumsum_log is also read just once per sn instead of per sm.
+      float cs_m[SG_M];
+      float beta_m[SG_M];
+      CUTE_UNROLL
+      for (int sm = 0; sm < SG_M; ++sm) {
+        int m_idx = m_sg_start + sm;
+        cs_m[sm] = cumsum_log_ptr[m_idx];
+        beta_m[sm] = beta_chunk_ptr[m_idx];
+      }
+
       CUTE_UNROLL
       for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
         int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
+        float cs_n = cumsum_log_ptr[n_idx];
         CUTE_UNROLL
         for (int sm = 0; sm < SG_M; ++sm) {
           int m_idx = m_sg_start + sm;
           if (m_idx > n_idx) {
-            float gate_scale = sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
-            float beta_val = beta_chunk_ptr[m_idx];
-            tSrKK(sn * SG_M + sm) *= gate_scale * beta_val;
+            // Keep this in LOG space: gate_scale = exp2(cumsum_log[m] -
+            // cumsum_log[n]) accumulates only the m..n decay, so the exponent
+            // stays bounded and well-conditioned. The algebraically-equal
+            // linear form cumprod[m]/cumprod[n] is NOT safe: cumprod[n] =
+            // exp2(cumsum_log[n]) with cumsum_log = prefix-sum of log2(alpha<=0)
+            // underflows to 0 for strong decay (e.g. exp2(-212) in fp32),
+            // giving x/0 = Inf/NaN in the valid (non-padding) region.
+            float gate_scale = sycl::exp2(cs_m[sm] - cs_n);
+            tSrKK(sn * SG_M + sm) *= gate_scale * beta_m[sm];
           } else if (m_idx == n_idx) {
             tSrKK(sn * SG_M + sm) = 1.0f;
           } else {
@@ -1378,8 +1392,6 @@ struct chunk_gated_delta_rule_v2_kernel {
       reorder(tSrKK, tCrKK_d);
       copy(copy_KK_d, tCrKK_d, tCgKK_d);
     }
-
-    item.barrier(sycl::access::fence_space::global_and_local);
   }
 
   // ============================================================================
@@ -1812,12 +1824,12 @@ struct chunk_gated_delta_rule_v2_kernel {
   // (128) as the main kernel so the KK build and inverse partition identically;
   // the grid is sized to fill the device (mirrors V1's inverse kernel).
   static sycl::nd_range<3> get_front_nd_range(int num_v_heads) {
-    MmaO1 mma_o1{};
-    int threads_per_wg = size(mma_o1);
+    MmaKK mma_kk{};
+    int threads_per_wg = size(mma_kk);
     int sm_count =
         cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
     int num_wg =
-        (sm_count * MaxThreadsPerSM / threads_per_wg + num_v_heads - 1) /
+        (sm_count * MaxThreadsPerSM_grf128 / threads_per_wg + num_v_heads - 1) /
         num_v_heads * num_v_heads;
     sycl::range<3> local(1, 1, threads_per_wg);
     sycl::range<3> global(1, num_wg, 1);
@@ -1842,6 +1854,15 @@ struct chunk_gated_delta_rule_v2_kernel {
 
   static int get_slm_size() {
     return slm_total_size;
+  }
+
+  // Front kernel only touches the alpha channels (cumsum_log / cumprod); it does
+  // NOT use the inverse scratch region. Allocating the full slm_total_size there
+  // (33 KB) would pin ~64x more SLM than needed and crush occupancy (dispatch
+  // resource stalls). Hand it just the alpha region so many more work-groups can
+  // reside per Xe-core and hide the load/barrier latency.
+  static int get_front_slm_size() {
+    return slm_alpha_size;
   }
 };
 
@@ -1956,12 +1977,16 @@ void kernel_launcher_v2(
   // entry point (run_front) differ.
   // -------------------------------------------------------------------------
   {
+    syclex::properties kernel_props_front{
+        syclex::sub_group_size<cute::detail::subgroup_size>,
+        intelex::grf_size<128>};
     auto front_range = Kernel::get_front_nd_range(num_v_heads);
+    int front_slm_size = Kernel::get_front_slm_size();
     queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
+      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(front_slm_size), cgh);
       cgh.parallel_for<ChunkGDNV2FrontKernel<T, StateT>>(
           front_range,
-          kernel_props,
+          kernel_props_front,
           [=](sycl::nd_item<3> item) {
             float* slm_ptr = static_cast<float*>(
                 local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
