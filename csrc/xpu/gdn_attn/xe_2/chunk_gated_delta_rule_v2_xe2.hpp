@@ -220,6 +220,8 @@ struct chunk_gated_delta_rule_v2_kernel {
   T* t_buf;               // [num_v_heads, total_virtual_seqlen, chunk_size] T_out buffer (Element)
   T* sk_buf;              // [num_v_heads, total_virtual_seqlen, head_v_dim] or reuse
   T* newv_buf;            // [num_v_heads, total_virtual_seqlen, head_v_dim] or reuse
+  float* cumsum_log_buf;  // [num_v_heads, total_virtual_seqlen] alpha cumsum_log channel
+  float* cumprod_buf;     // [num_v_heads, total_virtual_seqlen] alpha cumprod channel
 
   int batch_size;
   int total_seqlen;
@@ -304,6 +306,60 @@ struct chunk_gated_delta_rule_v2_kernel {
       cumprod_ptr[e] = 0.0f;
     }
 
+    item.barrier(sycl::access::fence_space::local_space);
+  }
+
+  // ============================================================================
+  // Persist the alpha channels (cumsum_log, cumprod) from SLM to global scratch.
+  // Called by the front kernel after compute_alpha_channels so the recurrent
+  // back kernel can reload them instead of recomputing the log2/scan/exp2.
+  // Precondition: compute_alpha_channels has populated SLM and issued its
+  // trailing local barrier (SLM is consistent across the work-group).
+  // ============================================================================
+  CUTE_DEVICE void store_alpha_channels(
+      const float* slm_ptr,
+      int v_head_id,
+      int chunk_offset,
+      sycl::nd_item<3>& item) const {
+    int local_id = item.get_local_linear_id();
+    int local_range = item.get_local_range(2);
+    const float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
+    const float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
+    float* g_cumsum_log = cumsum_log_buf +
+        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
+    float* g_cumprod = cumprod_buf +
+        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
+    CUTE_UNROLL
+    for (int e = local_id; e < chunk_size; e += local_range) {
+      g_cumsum_log[e] = cumsum_log_ptr[e];
+      g_cumprod[e] = cumprod_ptr[e];
+    }
+  }
+
+  // ============================================================================
+  // Reload the alpha channels (cumsum_log, cumprod) from global scratch into
+  // SLM. Replaces the redundant compute_alpha_channels call in the recurrent
+  // back kernel; the channels were already produced by the front kernel.
+  // Ends with a local barrier so the loaded SLM is visible work-group-wide.
+  // ============================================================================
+  CUTE_DEVICE void load_alpha_channels(
+      float* slm_ptr,
+      int v_head_id,
+      int chunk_offset,
+      sycl::nd_item<3>& item) const {
+    int local_id = item.get_local_linear_id();
+    int local_range = item.get_local_range(2);
+    float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
+    float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
+    const float* g_cumsum_log = cumsum_log_buf +
+        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
+    const float* g_cumprod = cumprod_buf +
+        static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
+    CUTE_UNROLL
+    for (int e = local_id; e < chunk_size; e += local_range) {
+      cumsum_log_ptr[e] = g_cumsum_log[e];
+      cumprod_ptr[e] = g_cumprod[e];
+    }
     item.barrier(sycl::access::fence_space::local_space);
   }
 
@@ -765,14 +821,12 @@ struct chunk_gated_delta_rule_v2_kernel {
     float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
     float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
     // =========================================================================
-    // Stage 1: Alpha preprocessing (3-channel)
+    // Stage 1: Alpha preprocessing (reload channels produced by front kernel)
+    // The cumsum_log / cumprod channels were already computed (log2/scan/exp2)
+    // by compute_front_body and persisted to global scratch; here we only load
+    // them into SLM to keep the log2/scan/exp2 off the recurrent critical path.
     // =========================================================================
-    const float* alpha_chunk_ptr =
-        alpha + static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
-    const float* beta_chunk_ptr =
-        beta + static_cast<int64_t>(v_head_id) * total_virtual_seqlen + chunk_offset;
-
-    compute_alpha_channels(slm_ptr, alpha_chunk_ptr, current_chunk_size, item);
+    load_alpha_channels(slm_ptr, v_head_id, chunk_offset, item);
 
     // =========================================================================
     // Stage 2: QK = Q×K^T and KK = K×K^T with fused causal mask + gate scaling
@@ -1248,6 +1302,10 @@ struct chunk_gated_delta_rule_v2_kernel {
 
     // Stage 1: alpha preprocessing (cumsum_log / cumprod into SLM).
     compute_alpha_channels(slm_ptr, alpha_chunk_ptr, current_chunk_size, item);
+
+    // Persist both channels to global scratch so the recurrent back kernel can
+    // reload them instead of recomputing the log2/scan/exp2 (design: Option A).
+    store_alpha_channels(slm_ptr, v_head_id, chunk_offset, item);
 
     // K tensor for this chunk.
     auto k_ptr_chunk =
@@ -1825,6 +1883,8 @@ void kernel_launcher_v2(
     T* t_buf,
     T* sk_buf,
     T* newv_buf,
+    float* cumsum_log_buf,
+    float* cumprod_buf,
     const int batch_size,
     const int total_seqlen,
     const int total_virtual_seqlen,
@@ -1880,6 +1940,7 @@ void kernel_launcher_v2(
       has_initial_state,
       token_indx,
       qk_buf, l_buf, t_buf, sk_buf, newv_buf,
+      cumsum_log_buf, cumprod_buf,
       batch_size,
       total_seqlen,
       total_virtual_seqlen,
@@ -1997,6 +2058,16 @@ void chunk_gated_delta_rule_v2_impl_xe2(
       {num_v_heads, total_virtual_seqlen},
       torch::dtype(torch::kFloat32).device(device).requires_grad(false));
 
+  // Alpha-channel scratch (design: Option A). The front kernel computes
+  // cumsum_log / cumprod once per chunk×head and persists them here so the
+  // recurrent back kernel reloads instead of recomputing log2/scan/exp2.
+  torch::Tensor cumsum_log_buf = torch::empty(
+      {num_v_heads, total_virtual_seqlen},
+      torch::dtype(torch::kFloat32).device(device).requires_grad(false));
+  torch::Tensor cumprod_buf = torch::empty(
+      {num_v_heads, total_virtual_seqlen},
+      torch::dtype(torch::kFloat32).device(device).requires_grad(false));
+
   // Allocate intermediate buffers (design §2.6)
   torch::Tensor qk_buf = torch::zeros(
       {num_v_heads, total_seqlen + padding_size, chunk_size},
@@ -2048,6 +2119,8 @@ void chunk_gated_delta_rule_v2_impl_xe2(
       reinterpret_cast<scalar_t*>(t_buf.data_ptr()),                   \
       reinterpret_cast<scalar_t*>(sk_buf.data_ptr()),                  \
       reinterpret_cast<scalar_t*>(newv_buf.data_ptr()),                \
+      reinterpret_cast<float*>(cumsum_log_buf.data_ptr()),             \
+      reinterpret_cast<float*>(cumprod_buf.data_ptr()),                \
       batch_size,                                                      \
       total_seqlen,                                                    \
       total_virtual_seqlen,                                            \
