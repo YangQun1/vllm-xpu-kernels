@@ -98,48 +98,48 @@ class ChunkPrepareV2Kernel;
 // ============================================================================
 
 // QK: Q×K^T, chunk-local attention
-// [C, Dk] x [C, Dk]^T → [C, C]
+// [C, Dk] x [C, Dk]^T → [C, C]  (64×64 output, 32 SGs)
 struct MmaPolicy_QK {
   using WGTile = Shape<_64, _64, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // SK: S×K^T, state readout
-// [Dv, Dk] x [C, Dk]^T → [Dv, C]
+// [Dv, Dk] x [C, Dk]^T → [Dv, C]  (128×64 output, 32 SGs, no dv loop)
 struct MmaPolicy_SK {
-  using WGTile = Shape<_64, _64, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using WGTile = Shape<_128, _64, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // Ṽ = V^T-SK
 // [C, Dv]^T - [Dv, C] → [Dv, C]
 
 // NewV: Ṽ×T^T, apply inverse
-// [Dv, C] x [C, C]^T → [Dv, C] 
+// [Dv, C] x [C, C]^T → [Dv, C]  (128×64 output, 32 SGs, no dv loop)
 struct MmaPolicy_NewV { 
-  using WGTile = Shape<_64, _64, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using WGTile = Shape<_128, _64, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // O1: QxS^T, inter-chunk output
-// [C, Dk] x [Dv, Dk]^T → [C, Dv]
+// [C, Dk] x [Dv, Dk]^T → [C, Dv]  (64×128 output, 32 SGs, no dv loop)
 struct MmaPolicy_O1 {
-  using WGTile = Shape<_64, _64, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using WGTile = Shape<_64, _128, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // O2: QKxNewV^T, intra-chunk output
-// [C, C] x [Dv, C]^T → [C, Dv]
+// [C, C] x [Dv, C]^T → [C, Dv]  (64×128 output, 32 SGs, no dv loop)
 struct MmaPolicy_O2 {
-  using WGTile = Shape<_64, _64, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using WGTile = Shape<_64, _128, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // KV: NewV×K → [Dv×Dk], state update
-// [Dv, C] x [C, Dk] → [Dv, Dk]
+// [Dv, C] x [C, Dk] → [Dv, Dk]  (128×128 output, 32 SGs, no dv/dk loop)
 struct MmaPolicy_KV {
-  using WGTile = Shape<_64, _64, _32>;
-  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+  using WGTile = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 
@@ -822,9 +822,9 @@ struct chunk_gated_delta_rule_v2_kernel {
   //
   // Data flow per chunk:
   //   Stage 1: Load cumsum_log / cumprod from global scratch → SLM
-  //   Stage 2: QK [C,C] = Q [C,Dk] × K [C,Dk]^T, fused causal mask + gate
-  //   ── barrier ──
-  //   Stage 4: SK [Dv,C] = S [Dv,Dk] × K [C,Dk]^T · diag(cumprod)
+  //   Stage 2+4: QK [C,C] = Q [C,Dk] × K [C,Dk]^T, fused causal mask + gate
+  //             SK [Dv,C] = S [Dv,Dk] × K [C,Dk]^T · diag(cumprod)
+  //             (K loaded once, shared via gemm_TTS_fused_2A)
   //   ── barrier ──
   //   Stage 5: NewV [Dv,C] = (V^T [Dv,C] - SK [Dv,C]) × T [C,C]^T
   //   ── barrier ──
@@ -832,7 +832,6 @@ struct chunk_gated_delta_rule_v2_kernel {
   //                      + QK [C,C] × NewV [Dv,C]^T
   //   ── barrier ──
   //   Stage 7: S' [Dv,Dk] = e^(g_last) · S + decay(NewV) [Dv,C] × K^T [Dk,C]^T
-  //   ── barrier ──
   //
   // Stages 4-7 are recurrent: they read/write S (ssm_state) sequentially.
   // Stages 4,5,6 tile along Dv (for dv in 0..Dv/C-1), fully independent.
@@ -903,67 +902,12 @@ struct chunk_gated_delta_rule_v2_kernel {
            static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
            chunk_offset * chunk_size;
 
-    // --- Stage 2: QK = Q×K^T ---
-    {
-      MmaQK mma_qk{};
-      auto thr_mma = mma_qk.get_slice(local_id);
-      auto wg_tile = mma_qk.tile_mnk();
-
-      static constexpr auto tile_m = get<0>(wg_tile);
-      static constexpr auto tile_n = get<1>(wg_tile);
-      static constexpr auto ATOM_M = get<1>(typename MmaQK::ThrLayoutVMNK{}.shape());
-      static constexpr auto ATOM_N = get<2>(typename MmaQK::ThrLayoutVMNK{}.shape());
-      static constexpr auto SG_M = tile_m / ATOM_M;
-      static constexpr auto SG_N = tile_n / ATOM_N;
-
-      auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
-      auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
-      int m_sg_start = sg_local_m_coord * SG_M;
-      int n_sg_start = sg_local_n_coord * SG_N;
-
-      Tensor cQK = make_identity_tensor(QK_shape);
-      Tensor gQK_C = local_tile(cQK, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
-      auto copy_QK_d = get_block_2d_copy_D<void>(mma_qk, QK_tensor);
-      auto thr_copy_QK_d = copy_QK_d.get_slice(local_id);
-      auto tCrQK_d = thr_copy_QK_d.partition_sg_fragment_S(gQK_C);
-      auto tCgQK_d = thr_copy_QK_d.partition_D(gQK_C);
-      auto tSrQK = thr_mma.partition_sg_fragment_C(gQK_C);
-
-      clear(tSrQK);
-      gemm_TTS(Q_tensor, K_tensor, tSrQK, 0, 0, mma_qk);
-
-      // Fused causal mask + gate scaling for QK
-      CUTE_UNROLL
-      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-        int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
-        CUTE_UNROLL
-        for (int sm = 0; sm < SG_M; ++sm) {
-          int m_idx = m_sg_start + sm;
-          // Scale by e^(g_i - g_j) where g = cumsum_log (in log2 space)
-          // NOTE: Q is already pre-scaled by 1/sqrt(d) in l2norm, no extra scale needed.
-          float gate_scale = sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
-          tSrQK(sn * SG_M + sm) *= gate_scale;
-          if (m_idx < n_idx) {
-            tSrQK(sn * SG_M + sm) = 0.0f;
-          }
-        }
-      }
-
-      reorder(tSrQK, tCrQK_d);
-      copy(copy_QK_d, tCrQK_d, tCgQK_d);
-    }
-
-    item.barrier(sycl::access::fence_space::global_and_local);
-
-    // =========================================================================
-    // Stage 4: SK = S×K^T · diag(cumprod) (skip if first chunk & no initial state)
-    // [Dv, Dk] x [C, Dk]^T → [Dv, C], then element-wise scale by cumprod[n]
-    // =========================================================================
+    // --- Stage 2+4 fused: QK = Q×K^T, SK = S×K^T (shared K load) ---
     auto v_ptr_chunk =
         v + static_cast<int64_t>(chunk_offset) * num_v_heads * head_v_dim +
         v_head_id * head_v_dim;
 
-    // SK and NewV buffers
+    // SK and NewV buffers (needed by later stages)
     auto SK_ptr = sk_buf +
                   static_cast<int64_t>(v_head_id) * total_virtual_seqlen * head_v_dim +
                   chunk_offset * head_v_dim;
@@ -971,40 +915,67 @@ struct chunk_gated_delta_rule_v2_kernel {
                     static_cast<int64_t>(v_head_id) * total_virtual_seqlen * head_v_dim +
                     chunk_offset * head_v_dim;
 
-    if (!is_first_block || has_prev_state) {
-      // gemm_TTS(S, K): C[dv, c] = Σ_dk S[dv,dk] × K[c,dk]
-      //   A = S [Dv, Dk], B = K [C, Dk] → SK [Dv, C]
-      MmaSK mma_sk{};
-      auto thr_mma_sk = mma_sk.get_slice(local_id);
-      auto wg_tile_sk = mma_sk.tile_mnk();
+    {
+      MmaQK mma_qk{};
+      auto thr_mma_qk = mma_qk.get_slice(local_id);
+      auto wg_tile_qk = mma_qk.tile_mnk();
 
-      // S [Dv, Dk] — ssm state
-      auto S_shape = make_shape(head_v_dim, head_k_dim);
-      auto S_tensor = make_tensor(
-          make_gmem_ptr(ssm_state_ptr),
-          make_layout(S_shape, make_stride(head_k_dim, _1{})));
+      // QK layout constants for post-processing
+      static constexpr auto tile_m_qk = get<0>(wg_tile_qk);
+      static constexpr auto tile_n_qk = get<1>(wg_tile_qk);
+      static constexpr auto ATOM_M_QK = get<1>(typename MmaQK::ThrLayoutVMNK{}.shape());
+      static constexpr auto ATOM_N_QK = get<2>(typename MmaQK::ThrLayoutVMNK{}.shape());
+      static constexpr auto SG_M_QK = tile_m_qk / ATOM_M_QK;
+      static constexpr auto SG_N_QK = tile_n_qk / ATOM_N_QK;
 
-      // SK [Dv, C] — output buffer
-      auto SK_shape = make_shape(head_v_dim, chunk_size);
-      auto SK_tensor = make_tensor(
-          make_gmem_ptr(SK_ptr),
-          make_layout(SK_shape, make_stride(chunk_size, _1{})));
+      auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N_QK;
+      auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N_QK;
+      int m_sg_start = sg_local_m_coord * SG_M_QK;
+      int n_sg_start = sg_local_n_coord * SG_N_QK;
 
-      Tensor cSK = make_identity_tensor(SK_shape);
-      auto copy_SK_d = get_block_2d_copy_D<void>(mma_sk, SK_tensor);
-      auto thr_copy_SK_d = copy_SK_d.get_slice(local_id);
+      // QK accumulator + store setup
+      Tensor cQK = make_identity_tensor(QK_shape);
+      Tensor gQK_C = local_tile(cQK, wg_tile_qk, make_coord(0, 0, 0), Step<_1, _1, X>{});
+      auto copy_QK_d = get_block_2d_copy_D<void>(mma_qk, QK_tensor);
+      auto thr_copy_QK_d = copy_QK_d.get_slice(local_id);
+      auto tCrQK_d = thr_copy_QK_d.partition_sg_fragment_S(gQK_C);
+      auto tCgQK_d = thr_copy_QK_d.partition_D(gQK_C);
+      auto tSrQK = thr_mma_qk.partition_sg_fragment_C(gQK_C);
+      clear(tSrQK);
 
-      for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-        Tensor gSK_C = local_tile(cSK, wg_tile_sk, make_coord(dv, 0, 0), Step<_1, _1, X>{});
+      // do_sk is WG-uniform → both paths hit same barrier count
+      if (!is_first_block || has_prev_state) {
+        // Fused path: QK + SK sharing K loads
+        MmaSK mma_sk{};
+        auto thr_mma_sk = mma_sk.get_slice(local_id);
+        auto wg_tile_sk = mma_sk.tile_mnk();
+
+        // S [Dv, Dk] — ssm state
+        auto S_shape = make_shape(head_v_dim, head_k_dim);
+        auto S_tensor = make_tensor(
+            make_gmem_ptr(ssm_state_ptr),
+            make_layout(S_shape, make_stride(head_k_dim, _1{})));
+
+        // SK [Dv, C] — output buffer
+        auto SK_shape = make_shape(head_v_dim, chunk_size);
+        auto SK_tensor = make_tensor(
+            make_gmem_ptr(SK_ptr),
+            make_layout(SK_shape, make_stride(chunk_size, _1{})));
+
+        Tensor cSK = make_identity_tensor(SK_shape);
+        Tensor gSK_C = local_tile(cSK, wg_tile_sk, make_coord(0, 0, 0), Step<_1, _1, X>{});
+        auto copy_SK_d = get_block_2d_copy_D<void>(mma_sk, SK_tensor);
+        auto thr_copy_SK_d = copy_SK_d.get_slice(local_id);
         auto tCrSK_d = thr_copy_SK_d.partition_sg_fragment_S(gSK_C);
         auto tCgSK_d = thr_copy_SK_d.partition_D(gSK_C);
         auto tSrSK = thr_mma_sk.partition_sg_fragment_C(gSK_C);
         clear(tSrSK);
 
-        // S[dv, :] × K^T via gemm_TTS(S, K): C[dv,c] = Σ_dk S[dv,dk] × K[c,dk]
-        gemm_TTS(S_tensor, K_tensor, tSrSK, dv, 0, mma_sk);
+        // Single fused GEMM: QK = Q×K^T, SK = S×K^T (K loaded once)
+        gemm_TTS_fused_2A(Q_tensor, S_tensor, K_tensor,
+                          tSrQK, tSrSK, 0, 0, 0, mma_qk, mma_sk);
 
-        // Scale by cumprod(alpha): SK_j *= cumprod[j]
+        // SK post-processing: scale by cumprod(alpha)
         static constexpr auto tile_n_sk = get<1>(wg_tile_sk);
         static constexpr auto ATOM_N_SK = get<2>(typename MmaSK::ThrLayoutVMNK{}.shape());
         static constexpr auto SG_N_SK = tile_n_sk / ATOM_N_SK;
@@ -1013,7 +984,7 @@ struct chunk_gated_delta_rule_v2_kernel {
 
         auto sg_local_n_coord_sk = cutlass::get_sub_group_id() % ATOM_N_SK;
         int n_sg_start_sk = sg_local_n_coord_sk * SG_N_SK;
- 
+
         CUTE_UNROLL
         for (int sn = 0; sn < SG_N_SK / sub_group_size; ++sn) {
           int n_idx = n_sg_start_sk + sn * sub_group_size + sg_local_id;
@@ -1026,7 +997,28 @@ struct chunk_gated_delta_rule_v2_kernel {
 
         reorder(tSrSK, tCrSK_d);
         copy(copy_SK_d, tCrSK_d, tCgSK_d);
+      } else {
+        // No state: just QK, no SK needed
+        gemm_TTS(Q_tensor, K_tensor, tSrQK, 0, 0, mma_qk);
       }
+
+      // QK post-processing: causal mask + gate scaling
+      CUTE_UNROLL
+      for (int sn = 0; sn < SG_N_QK / sub_group_size; ++sn) {
+        int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
+        CUTE_UNROLL
+        for (int sm = 0; sm < SG_M_QK; ++sm) {
+          int m_idx = m_sg_start + sm;
+          float gate_scale = sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
+          tSrQK(sn * SG_M_QK + sm) *= gate_scale;
+          if (m_idx < n_idx) {
+            tSrQK(sn * SG_M_QK + sm) = 0.0f;
+          }
+        }
+      }
+
+      reorder(tSrQK, tCrQK_d);
+      copy(copy_QK_d, tCrQK_d, tCgQK_d);
     }
 
     item.barrier(sycl::access::fence_space::global_and_local);
@@ -1063,33 +1055,24 @@ struct chunk_gated_delta_rule_v2_kernel {
       auto copy_NewV_d = get_block_2d_copy_D<void>(mma_newv, NewV_tensor);
       auto thr_copy_NewV_d = copy_NewV_d.get_slice(local_id);
 
-      for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-        Tensor gNewV_C = local_tile(cNewV, wg_tile_newv, make_coord(dv, 0, 0), Step<_1, _1, X>{});
+      {
+        Tensor gNewV_C = local_tile(cNewV, wg_tile_newv, make_coord(0, 0, 0), Step<_1, _1, X>{});
         auto tCrNewV_d = thr_copy_NewV_d.partition_sg_fragment_S(gNewV_C);
         auto tCgNewV_d = thr_copy_NewV_d.partition_D(gNewV_C);
         auto tSrNewV = thr_mma_newv.partition_sg_fragment_C(gNewV_C);
         clear(tSrNewV);
 
         if (!is_first_block || has_prev_state) {
-          // NewV = (V^T - SK) × T^T = V^T×T^T - SK×T^T
+          // NewV = (V^T - SK) × T^T — fused subtract-then-GEMM
           auto SK_shape_s5 = make_shape(head_v_dim, chunk_size);
           auto SK_tensor_s5 = make_tensor(
               make_gmem_ptr(SK_ptr),
               make_layout(SK_shape_s5, make_stride(chunk_size, _1{})));
 
-          gemm_TTS(VT_tensor, T_tensor, tSrNewV, dv, 0, mma_newv);
-
-          decltype(tSrNewV) tSrSKT;
-          clear(tSrSKT);
-          gemm_TTS(SK_tensor_s5, T_tensor, tSrSKT, dv, 0, mma_newv);
-
-          CUTE_UNROLL
-          for (int i = 0; i < tSrNewV.size(); ++i) {
-            tSrNewV(i) -= tSrSKT(i);
-          }
+          gemm_TTS_sub_2A(VT_tensor, SK_tensor_s5, T_tensor, tSrNewV, 0, 0, mma_newv);
         } else {
           // No previous state: SK=0, NewV = V^T × T^T
-          gemm_TTS(VT_tensor, T_tensor, tSrNewV, dv, 0, mma_newv);
+          gemm_TTS(VT_tensor, T_tensor, tSrNewV, 0, 0, mma_newv);
         }
 
         reorder(tSrNewV, tCrNewV_d);
@@ -1164,9 +1147,8 @@ struct chunk_gated_delta_rule_v2_kernel {
       auto copy_O_d = get_block_2d_copy_D<void>(mma_o1, O_tensor);
       auto thr_copy_O_d = copy_O_d.get_slice(local_id);
 
-      for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-        // Tile: M=C at coord 0, N=Dv at coord dv
-        Tensor gO_C = local_tile(cO, wg_tile_o1, make_coord(0, dv, 0), Step<_1, _1, X>{});
+      {
+        Tensor gO_C = local_tile(cO, wg_tile_o1, make_coord(0, 0, 0), Step<_1, _1, X>{});
         auto tCrO_d = thr_copy_O_d.partition_sg_fragment_S(gO_C);
         auto tCgO_d = thr_copy_O_d.partition_D(gO_C);
         auto tSrO = thr_mma_o1.partition_sg_fragment_C(gO_C);
@@ -1174,9 +1156,9 @@ struct chunk_gated_delta_rule_v2_kernel {
 
         // O1: diag(cumprod) · Q × S^T (inter-chunk)
         // gemm_TTS(Q, S): C[c, dv] = Σ_dk Q[c, dk] × S[dv, dk]
-        //   A=Q [C, Dk], B=S [Dv, Dk], wg_m=0, wg_n=dv
+        //   A=Q [C, Dk], B=S [Dv, Dk], wg_m=0, wg_n=0
         if (!is_first_block || has_prev_state) {
-          gemm_TTS(Q_tensor, S_tensor, tSrO, 0, dv, mma_o1);
+          gemm_TTS(Q_tensor, S_tensor, tSrO, 0, 0, mma_o1);
 
           // Scale by cumprod per-token (M dimension = tokens)
           CUTE_UNROLL
@@ -1192,8 +1174,8 @@ struct chunk_gated_delta_rule_v2_kernel {
 
         // O2: QK × NewV^T (intra-chunk)
         // gemm_TTS(QK, NewV): C[c, dv] = Σ_c' QK[c, c'] × NewV[dv, c']
-        //   A=QK [C, C], B=NewV [Dv, C], wg_m=0, wg_n=dv
-        gemm_TTS(QK_tensor_s6, NewV_tensor, tSrO, 0, dv, mma_o2);
+        //   A=QK [C, C], B=NewV [Dv, C], wg_m=0, wg_n=0
+        gemm_TTS(QK_tensor_s6, NewV_tensor, tSrO, 0, 0, mma_o2);
 
         reorder(tSrO, tCrO_d);
         copy(copy_O_d, tCrO_d, tCgO_d);
@@ -1252,45 +1234,41 @@ struct chunk_gated_delta_rule_v2_kernel {
       auto thr_copy_S_c = copy_S_c.get_slice(local_id);
       auto thr_copy_S_d = copy_S_d.get_slice(local_id);
 
-      for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-        for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-          Tensor gS_C = local_tile(cS, wg_tile_kv, make_coord(dv, dk, 0), Step<_1, _1, X>{});
-          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
-          auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
-          auto tSrS = thr_mma_kv.partition_sg_fragment_C(gS_C);
+      {
+        Tensor gS_C = local_tile(cS, wg_tile_kv, make_coord(0, 0, 0), Step<_1, _1, X>{});
+        auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
+        auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
+        auto tSrS = thr_mma_kv.partition_sg_fragment_C(gS_C);
 
-          // Seed with e^(g_last) * S_prev
-          if (!is_first_block || has_prev_state) {
-            auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
-            auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
-            copy(copy_S_c, tCgS_c, tCrS_c);
-            reorder(tCrS_c, tSrS);
-            CUTE_UNROLL
-            for (int i = 0; i < tSrS.size(); ++i) {
-              tSrS(i) *= g_last_decay;
-            }
-          } else {
-            clear(tSrS);
-          }
-
-          // S' += Σ_c decay[c] · NewV[dv,c] · K^T[dk,c]
-          // decay[c] = exp2(g_last - cumsum_log[c])
-          float* decay_slm = cumprod_ptr;  // Reuse since output already written
+        // Seed with e^(g_last) * S_prev
+        if (!is_first_block || has_prev_state) {
+          auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
+          auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
+          copy(copy_S_c, tCgS_c, tCrS_c);
+          reorder(tCrS_c, tSrS);
           CUTE_UNROLL
-          for (int e = local_id; e < chunk_size; e += local_range) {
-            decay_slm[e] = sycl::exp2(g_last - cumsum_log_ptr[e]);
+          for (int i = 0; i < tSrS.size(); ++i) {
+            tSrS(i) *= g_last_decay;
           }
-          item.barrier(sycl::access::fence_space::local_space);
-
-          gemm_TTS_k_multi(NewV_tensor, KT_tensor, tSrS, dv, dk, mma_kv, decay_slm);
-
-          reorder(tSrS, tCrS_d);
-          copy(copy_S_d, tCrS_d, tCgS_d);
+        } else {
+          clear(tSrS);
         }
+
+        // S' += Σ_c decay[c] · NewV[dv,c] · K^T[dk,c]
+        // decay[c] = exp2(g_last - cumsum_log[c])
+        float* decay_slm = cumprod_ptr;  // Reuse since output already written
+        CUTE_UNROLL
+        for (int e = local_id; e < chunk_size; e += local_range) {
+          decay_slm[e] = sycl::exp2(g_last - cumsum_log_ptr[e]);
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+
+        gemm_TTS_k_multi(NewV_tensor, KT_tensor, tSrS, 0, 0, mma_kv, decay_slm);
+
+        reorder(tSrS, tCrS_d);
+        copy(copy_S_d, tCrS_d, tCgS_d);
       }
     }
-
-    item.barrier(sycl::access::fence_space::global_and_local);
   }
 
   // ============================================================================
@@ -1896,9 +1874,9 @@ if (sg_id == 0) {
   // ============================================================================
   static sycl::nd_range<3> get_nd_range(int batch_size, int num_v_heads) {
     // One workgroup per (batch, v_head) pair
-    // Use the largest MMA policy to determine thread count
-    MmaO1 mma_o1{};
-    int threads_per_wg = size(mma_o1);
+    // Use the largest MMA policy (KV: 128×128, 32 SGs = 512 threads)
+    MmaKV mma_kv{};
+    int threads_per_wg = size(mma_kv);
     sycl::range<3> local(1, 1, threads_per_wg);
     sycl::range<3> global(batch_size, num_v_heads, 1);
     return sycl::nd_range<3>{global * local, local};
@@ -2008,15 +1986,16 @@ void kernel_launcher_v2(
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
 
-  syclex::properties kernel_props{
-      syclex::sub_group_size<cute::detail::subgroup_size>,
-      intelex::grf_size<256>};
+
 
   // -------------------------------------------------------------------------
   // Step 1: Launch V2 prepare kernel (design §2.9)
   //   T is already resolved, no dtype dispatch needed.
   // -------------------------------------------------------------------------
   {
+    syclex::properties kernel_props_prepare{
+      syclex::sub_group_size<cute::detail::subgroup_size>,
+      intelex::grf_size<128>};
     int sm_count =
         cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
     sycl::range<3> local_prepare(1, 1, MaxThreadsPerSM);
@@ -2025,7 +2004,7 @@ void kernel_launcher_v2(
     queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for<ChunkPrepareV2Kernel<T, StateT>>(
           sycl::nd_range<3>{global_prepare * local_prepare, local_prepare},
-          kernel_props,
+          kernel_props_prepare,
           [=](auto) {
             chunk_prepare_v2_kernel<T, StateT>(
                 alpha_buf, a_raw, A_log, dt_bias,
@@ -2037,8 +2016,6 @@ void kernel_launcher_v2(
   // -------------------------------------------------------------------------
   // Step 2: Launch main V2 kernel
   // -------------------------------------------------------------------------
-  auto nd_range = Kernel::get_nd_range(batch_size, num_v_heads);
-  int slm_size = Kernel::get_slm_size();
 
   Kernel kernel_obj{
       core_attn_out,
@@ -2107,17 +2084,24 @@ void kernel_launcher_v2(
     });
   }
 
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
-    cgh.parallel_for<ChunkGDNV2Kernel<T, StateT>>(
-        nd_range,
-        kernel_props,
-        [=](sycl::nd_item<3> item) {
-          float* slm_ptr = static_cast<float*>(
-              local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
-          kernel_obj(item, slm_ptr);
-        });
-  });
+  {
+    syclex::properties kernel_props{
+      syclex::sub_group_size<cute::detail::subgroup_size>,
+      intelex::grf_size<128>};
+    auto nd_range = Kernel::get_nd_range(batch_size, num_v_heads);
+    int slm_size = Kernel::get_slm_size();
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
+      cgh.parallel_for<ChunkGDNV2Kernel<T, StateT>>(
+          nd_range,
+          kernel_props,
+          [=](sycl::nd_item<3> item) {
+            float* slm_ptr = static_cast<float*>(
+                local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
+            kernel_obj(item, slm_ptr);
+          });
+    });
+  }
 }
 
 // ============================================================================
