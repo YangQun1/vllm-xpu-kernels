@@ -920,22 +920,13 @@ struct chunk_gated_delta_rule_v2_kernel {
       auto thr_mma_qk = mma_qk.get_slice(local_id);
       auto wg_tile_qk = mma_qk.tile_mnk();
 
-      // QK layout constants for post-processing
-      static constexpr auto tile_m_qk = get<0>(wg_tile_qk);
-      static constexpr auto tile_n_qk = get<1>(wg_tile_qk);
-      static constexpr auto ATOM_M_QK = get<1>(typename MmaQK::ThrLayoutVMNK{}.shape());
-      static constexpr auto ATOM_N_QK = get<2>(typename MmaQK::ThrLayoutVMNK{}.shape());
-      static constexpr auto SG_M_QK = tile_m_qk / ATOM_M_QK;
-      static constexpr auto SG_N_QK = tile_n_qk / ATOM_N_QK;
-
-      auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N_QK;
-      auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N_QK;
-      int m_sg_start = sg_local_m_coord * SG_M_QK;
-      int n_sg_start = sg_local_n_coord * SG_N_QK;
-
       // QK accumulator + store setup
       Tensor cQK = make_identity_tensor(QK_shape);
       Tensor gQK_C = local_tile(cQK, wg_tile_qk, make_coord(0, 0, 0), Step<_1, _1, X>{});
+      // Per-thread (m, n) coordinate of each accumulator element. Element i of
+      // the C fragment aligns with cQK_coord(i): partition_sg_fragment_C decays
+      // to make_fragment_C(partition_C(...)), sharing iteration order.
+      auto cQK_coord = thr_mma_qk.partition_C(gQK_C);
       auto copy_QK_d = get_block_2d_copy_D<void>(mma_qk, QK_tensor);
       auto thr_copy_QK_d = copy_QK_d.get_slice(local_id);
       auto tCrQK_d = thr_copy_QK_d.partition_sg_fragment_S(gQK_C);
@@ -975,24 +966,12 @@ struct chunk_gated_delta_rule_v2_kernel {
         gemm_TTS_fused_2A(Q_tensor, S_tensor, K_tensor,
                           tSrQK, tSrSK, 0, 0, 0, mma_qk, mma_sk);
 
-        // SK post-processing: scale by cumprod(alpha)
-        static constexpr auto tile_n_sk = get<1>(wg_tile_sk);
-        static constexpr auto ATOM_N_SK = get<2>(typename MmaSK::ThrLayoutVMNK{}.shape());
-        static constexpr auto SG_N_SK = tile_n_sk / ATOM_N_SK;
-        static constexpr auto ATOM_M_SK = get<1>(typename MmaSK::ThrLayoutVMNK{}.shape());
-        static constexpr auto SG_M_SK = get<0>(wg_tile_sk) / ATOM_M_SK;
-
-        auto sg_local_n_coord_sk = cutlass::get_sub_group_id() % ATOM_N_SK;
-        int n_sg_start_sk = sg_local_n_coord_sk * SG_N_SK;
-
+        // SK post-processing: scale each column (token) by cumprod(alpha)
+        auto cSK_coord = thr_mma_sk.partition_C(gSK_C);
         CUTE_UNROLL
-        for (int sn = 0; sn < SG_N_SK / sub_group_size; ++sn) {
-          int n_idx = n_sg_start_sk + sn * sub_group_size + sg_local_id;
-          float cp = cumprod_ptr[n_idx];
-          CUTE_UNROLL
-          for (int sm = 0; sm < SG_M_SK; ++sm) {
-            tSrSK(sn * SG_M_SK + sm) *= cp;
-          }
+        for (int i = 0; i < tSrSK.size(); ++i) {
+          int n_idx = get<1>(cSK_coord(i));
+          tSrSK(i) *= cumprod_ptr[n_idx];
         }
 
         reorder(tSrSK, tCrSK_d);
@@ -1004,16 +983,12 @@ struct chunk_gated_delta_rule_v2_kernel {
 
       // QK post-processing: causal mask + gate scaling
       CUTE_UNROLL
-      for (int sn = 0; sn < SG_N_QK / sub_group_size; ++sn) {
-        int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
-        CUTE_UNROLL
-        for (int sm = 0; sm < SG_M_QK; ++sm) {
-          int m_idx = m_sg_start + sm;
-          float gate_scale = sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
-          tSrQK(sn * SG_M_QK + sm) *= gate_scale;
-          if (m_idx < n_idx) {
-            tSrQK(sn * SG_M_QK + sm) = 0.0f;
-          }
+      for (int i = 0; i < tSrQK.size(); ++i) {
+        int m_idx = get<0>(cQK_coord(i));
+        int n_idx = get<1>(cQK_coord(i));
+        tSrQK(i) *= sycl::exp2(cumsum_log_ptr[m_idx] - cumsum_log_ptr[n_idx]);
+        if (m_idx < n_idx) {
+          tSrQK(i) = 0.0f;
         }
       }
 
@@ -1102,19 +1077,7 @@ struct chunk_gated_delta_rule_v2_kernel {
           std::is_same_v<MmaO1, MmaO2>,
           "Stage 6 shared-accumulator path requires MmaO1 and MmaO2 to match");
 
-      static constexpr auto tile_m_o1 = get<0>(wg_tile_o1);
-      static constexpr auto tile_n_o1 = get<1>(wg_tile_o1);
-      static constexpr auto ATOM_M_O1 = get<1>(typename MmaO1::ThrLayoutVMNK{}.shape());
-      static constexpr auto ATOM_N_O1 = get<2>(typename MmaO1::ThrLayoutVMNK{}.shape());
-      static constexpr auto SG_M_O1 = tile_m_o1 / ATOM_M_O1;
-      static constexpr auto SG_N_O1 = tile_n_o1 / ATOM_N_O1;
-
-      auto sg_local_m_coord_o1 = cutlass::get_sub_group_id() / ATOM_N_O1;
-      auto sg_local_n_coord_o1 = cutlass::get_sub_group_id() % ATOM_N_O1;
-      int m_sg_start_o1 = sg_local_m_coord_o1 * SG_M_O1;
-      int n_sg_start_o1 = sg_local_n_coord_o1 * SG_N_O1;
-
-      // S [Dv, Dk] — B operand for O1
+      // S [Dv, Dk] — A operand for O1^T
       auto S_shape = make_shape(head_v_dim, head_k_dim);
       auto S_tensor = make_tensor(
           make_gmem_ptr(ssm_state_ptr),
@@ -1153,6 +1116,8 @@ struct chunk_gated_delta_rule_v2_kernel {
         auto tCgO_d = thr_copy_O_d.partition_D(gO_C);
         auto tSrO = thr_mma_o1.partition_sg_fragment_C(gO_C);
         clear(tSrO);
+        // Per-thread (dv, token) coordinate of each accumulator element.
+        auto cO_coord = thr_mma_o1.partition_C(gO_C);
 
         // O1: diag(cumprod) · Q × S^T (inter-chunk)
         // gemm_TTS(Q, S): C[c, dv] = Σ_dk Q[c, dk] × S[dv, dk]
@@ -1162,13 +1127,9 @@ struct chunk_gated_delta_rule_v2_kernel {
 
           // Scale by cumprod per-token (M dimension = tokens)
           CUTE_UNROLL
-          for (int sm = 0; sm < SG_M_O1; ++sm) {
-            int m_idx = m_sg_start_o1 + sm;
-            float cps = cumprod_ptr[m_idx];
-            CUTE_UNROLL
-            for (int sn = 0; sn < SG_N_O1 / sub_group_size; ++sn) {
-              tSrO(sn * SG_M_O1 + sm) *= cps;
-            }
+          for (int i = 0; i < tSrO.size(); ++i) {
+            int m_idx = get<0>(cO_coord(i));
+            tSrO(i) *= cumprod_ptr[m_idx];
           }
         }
 
