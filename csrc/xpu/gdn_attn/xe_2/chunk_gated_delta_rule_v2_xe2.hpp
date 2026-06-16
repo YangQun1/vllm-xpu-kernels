@@ -290,6 +290,12 @@ struct chunk_gated_delta_rule_v2_kernel {
     int local_id = item.get_local_linear_id();
     int local_range = item.get_local_range(2);
 
+    // WAR fence: sub-groups from the previous chunk iteration may still be
+    // reading cumsum_log_ptr in the Stage 2 (KK) epilogue; all must arrive
+    // before any sub-group refills the SLM (cumsum_log_ptr/cumprod_ptr) for
+    // this chunk.
+    item.barrier(sycl::access::fence_space::local_space);
+
     float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
     float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
     float* g_cumsum_log = cumsum_log_buf +
@@ -366,6 +372,13 @@ struct chunk_gated_delta_rule_v2_kernel {
       sycl::nd_item<3>& item) const {
     int local_id = item.get_local_linear_id();
     int local_range = item.get_local_range(2);
+
+    // WAR fence: sub-groups from the previous chunk iteration may still be
+    // reading cumsum_log_ptr/cumprod_ptr (Stage 7 reuses cumprod_ptr as
+    // decay_slm); all must arrive before any sub-group refills the SLM for
+    // this chunk.
+    item.barrier(sycl::access::fence_space::local_space);
+
     float* cumsum_log_ptr = slm_ptr + slm_cumsum_log_offset;
     float* cumprod_ptr = slm_ptr + slm_cumprod_offset;
     const float* g_cumsum_log = cumsum_log_buf +
