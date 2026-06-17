@@ -608,15 +608,33 @@ struct chunk_gated_delta_rule_v2_kernel {
           make_gmem_ptr(v_ptr_chunk),
           make_layout(VT_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
 
-      // NewV [Dv, C] — output buffer
+      // NewV [Dv, C] — raw output buffer (consumed by Stage 6 O2).
       auto NewV_shape = make_shape(head_v_dim, chunk_size);
       auto NewV_tensor = make_tensor(
           make_gmem_ptr(NewV_ptr),
           make_layout(NewV_shape, make_stride(chunk_size, _1{})));
 
+      // Decayed NewV [Dv, C] — written into sk_buf (which is free after the SK
+      // read below) for Stage 7's KV update. NewV_decay[:,n] =
+      // exp2(g_last - g_n) · NewV[:,n]. The exponent is <= 0 (g is monotonically
+      // decreasing within a chunk, so g_last <= g_n), hence bounded/safe. This
+      // decayed copy is consumed DIRECTLY by Stage 7's plain gemm_TTS and is
+      // never "un-decayed", so any fp16/bf16 underflow-to-0 of strongly-decayed
+      // early tokens is harmless (their contribution to the state is ~0). This
+      // pre-bakes what gemm_TTS_k_multi used to compute per-k inside the KV
+      // GEMM, letting Stage 7 use a clean, fully-pipelined plain gemm_TTS.
+      auto NewVDecay_tensor = make_tensor(
+          make_gmem_ptr(SK_ptr),
+          make_layout(NewV_shape, make_stride(chunk_size, _1{})));
+
       Tensor cNewV = make_identity_tensor(NewV_shape);
       auto copy_NewV_d = get_block_2d_copy_D<void>(mma_newv, NewV_tensor);
       auto thr_copy_NewV_d = copy_NewV_d.get_slice(local_id);
+      auto copy_NewVDecay_d = get_block_2d_copy_D<void>(mma_newv, NewVDecay_tensor);
+      auto thr_copy_NewVDecay_d = copy_NewVDecay_d.get_slice(local_id);
+
+      // g_last = cumsum_log at the last valid position (decay baseline).
+      float g_last_s5 = cumsum_log_ptr[current_chunk_size - 1];
 
       // Loop over Dv row tiles (head_v_dim may be > one WGTile M, e.g. 256).
       const int n_dv_tiles_newv = head_v_dim / static_cast<int>(get<0>(wg_tile_newv));
@@ -640,8 +658,35 @@ struct chunk_gated_delta_rule_v2_kernel {
           gemm_TTS(VT_tensor, T_tensor, tSrNewV, dv, 0, mma_newv);
         }
 
+        // Store raw NewV → newv_buf (Stage 6 O2 reads this). reorder does not
+        // mutate tSrNewV, so it still holds the raw values afterwards.
         reorder(tSrNewV, tCrNewV_d);
         copy(copy_NewV_d, tCrNewV_d, tCgNewV_d);
+
+        // WAR barrier before overwriting sk_buf with decayed NewV.
+        // The NewV GEMM above reads SK as its A2 operand. Under
+        // MmaPolicy_NewV's SGLayout<8,4,1> the C(N) columns are split across 4
+        // sub-groups that all read the SAME SK rows (A does not depend on N),
+        // and each of them is about to write its 16 owned columns back into
+        // those rows. gemm_TTS_sub_2A has no barrier after its final k-tile
+        // A-load, so without this fence a fast sub-group could overwrite SK
+        // columns that a slow sub-group still needs to read for its last
+        // k-tile. Synchronize the whole work-group so every sub-group has
+        // finished reading SK before any decayed value is stored back.
+        item.barrier(sycl::access::fence_space::global_and_local);
+
+        // Build + store decayed NewV → sk_buf (Stage 7 reads this). The SK tile
+        // consumed by the GEMM above is now free, so we overwrite it in place.
+        auto cNewV_coord = thr_mma_newv.partition_C(gNewV_C);
+        CUTE_UNROLL
+        for (int i = 0; i < tSrNewV.size(); ++i) {
+          int n_idx = get<1>(cNewV_coord(i));
+          tSrNewV(i) *= sycl::exp2(g_last_s5 - cumsum_log_ptr[n_idx]);
+        }
+        auto tCrNewVDecay_d = thr_copy_NewVDecay_d.partition_sg_fragment_S(gNewV_C);
+        auto tCgNewVDecay_d = thr_copy_NewVDecay_d.partition_D(gNewV_C);
+        reorder(tSrNewV, tCrNewVDecay_d);
+        copy(copy_NewVDecay_d, tCrNewVDecay_d, tCgNewVDecay_d);
       }
     }
 
@@ -736,18 +781,19 @@ struct chunk_gated_delta_rule_v2_kernel {
       }
     }
 
-    // Barrier between Stage 6 and Stage 7: Stage 6 reads cumprod_ptr
-    // (SLM) and ssm_state (global). Stage 7 overwrites cumprod_ptr
-    // (reused as decay_slm) and writes ssm_state. Without this barrier,
-    // fast sub-groups entering Stage 7 can corrupt data still being read
-    // by slow sub-groups in Stage 6.
+    // Barrier between Stage 6 and Stage 7: Stage 6 reads ssm_state (global).
+    // Stage 7 writes ssm_state. Without this barrier, fast sub-groups entering
+    // Stage 7 can corrupt the state still being read by slow sub-groups in
+    // Stage 6.
     item.barrier(sycl::access::fence_space::global_and_local);
 
     // =========================================================================
     // Stage 7: State update S' = e^(g_last) · S + decay(NewV) × K
-    //   decay(NewV)_j = e^(g_last - g_j) · NewV_j
-    //   gemm_TTS_k_multi(NewV, K^T, decay): S'[dv, dk] = Σ_c decay[c]·NewV[dv,c]·K^T[dk,c]
-    //   [Dv, C] x [Dk, C]^T → [Dv, Dk], with per-k scaling by decay[c]
+    //   decay(NewV)_j = e^(g_last - g_j) · NewV_j  is PRE-BAKED in Stage 5 into
+    //   sk_buf, so here it is a plain GEMM (no per-k decay callback): a clean,
+    //   fully-pipelined gemm_TTS reading the decayed NewV from sk_buf.
+    //   gemm_TTS(NewV_decay, K^T): S'[dv, dk] = Σ_c NewV_decay[dv,c]·K^T[dk,c]
+    //   [Dv, C] x [Dk, C]^T → [Dv, Dk]
     // =========================================================================
     {
       MmaKV mma_kv{};
@@ -770,10 +816,11 @@ struct chunk_gated_delta_rule_v2_kernel {
           make_gmem_ptr(k_ptr_chunk),
           make_layout(KT_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
 
-      // NewV [Dv, C]
+      // NewV_decay [Dv, C] — read the pre-decayed NewV from sk_buf (Stage 5
+      // already applied exp2(g_last - g_j) per column).
       auto NewV_shape = make_shape(head_v_dim, chunk_size);
       auto NewV_tensor = make_tensor(
-          make_gmem_ptr(NewV_ptr),
+          make_gmem_ptr(SK_ptr),
           make_layout(NewV_shape, make_stride(chunk_size, _1{})));
 
       // S [Dv, Dk]
@@ -787,15 +834,6 @@ struct chunk_gated_delta_rule_v2_kernel {
       auto copy_S_d = get_block_2d_copy_D<void>(mma_kv, S_tensor);
       auto thr_copy_S_c = copy_S_c.get_slice(local_id);
       auto thr_copy_S_d = copy_S_d.get_slice(local_id);
-
-      // decay[c] = exp2(g_last - cumsum_log[c]) — shared across all (dv,dk) tiles
-      // (chunk-local, independent of Dv/Dk). Compute once before the tile loops.
-      float* decay_slm = cumprod_ptr;  // Reuse since output already written
-      CUTE_UNROLL
-      for (int e = local_id; e < chunk_size; e += local_range) {
-        decay_slm[e] = sycl::exp2(g_last - cumsum_log_ptr[e]);
-      }
-      item.barrier(sycl::access::fence_space::local_space);
 
       // Loop over Dv×Dk output tiles (head_v_dim/head_k_dim may be > 128, e.g. 256).
       const int n_dv_tiles_kv = head_v_dim / static_cast<int>(get<0>(wg_tile_kv));
@@ -821,8 +859,14 @@ struct chunk_gated_delta_rule_v2_kernel {
             clear(tSrS);
           }
 
-          // S' += Σ_c decay[c] · NewV[dv,c] · K^T[dk,c]
-          gemm_TTS_k_multi(NewV_tensor, KT_tensor, tSrS, dv, dk, mma_kv, decay_slm);
+          // S' += Σ_c NewV_decay[dv,c] · K^T[dk,c]   (decay pre-baked in Stage 5)
+          gemm_TTS(
+              NewV_tensor,
+              KT_tensor,
+              tSrS,
+              dv,
+              dk,
+              mma_kv);
 
           reorder(tSrS, tCrS_d);
           copy(copy_S_d, tCrS_d, tCgS_d);
